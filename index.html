@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#0b101b">
 <title>Inoculum — living specimen simulator</title>
-<meta name="description" content="An agent-based microbiology simulator: 40 bacteria and archaea, plant and animal cells, 38 experiments, and instruments that measure the culture the way a bench does.">
+<meta name="description" content="An agent-based microbiology simulator: 40 bacteria and archaea, plant and animal cells, 41 experiments, and instruments — a flow cytometer, a checkerboard, the Luria–Delbrück fluctuation test — that measure the culture the way a bench does.">
 <meta name="robots" content="index,follow">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -2055,7 +2055,7 @@ const CHEMS = {
   tel: { key: 'tel', name: 'Potassium tellurite', cls: 'Selective salt', unit: 'µg/mL', D: 20000, half: 0, conc: [1, 10, 100], k: 0.55, ec50: 8, spore: 0.2,
     target: 'Reduced inside the cell to metallic tellurium, which precipitates and poisons it',
     blurb: 'Most organisms die; a few reduce it safely and turn jet black doing so, which is how a diphtheria colony is spotted on tellurite agar. Staphylococci tolerate it too, which is the basis of Baird-Parker medium.' },
-  nis: { key: 'nis', name: 'Nisin', cls: 'Lantibiotic bacteriocin', unit: 'IU/mL', D: 7000, half: 240, conc: [10, 100, 1000], k: 0.9, ec50: 45, spore: 0.25, gramPos: 1,
+  nis: { key: 'nis', name: 'Nisin', cls: 'Lantibiotic bacteriocin', unit: 'IU/mL', D: 7000, half: 240, conc: [10, 100, 1000], k: 0.9, ec50: 45, spore: 0.25, gramPos: 1, gnLeak: 0.001,
     target: 'Binds lipid II, then uses it to punch a pore in the membrane',
     blurb: 'Made by Lactococcus and the only bacteriocin licensed as a food additive, in cheese since 1951. Binding lipid II — the same molecule vancomycin binds — makes resistance rare. It has no effect on Gram-negatives because it cannot cross the outer membrane.' },
   // ---- agents that change the physical medium ----
@@ -2382,6 +2382,12 @@ function makeBact(sp, x, y, o) {
     spore: o.spore || 0, sporeT: 0, qs: false, bio: false, lys: !!o.lys, lysV: o.lysV || 'lam', inf: null,
     g: { cip: 0, amp: 0, tet: 0, gen: 0, van: 0, cro: 0, mem: 0, azi: 0, col: 0, lzd: 0, mtz: 0, rif: 0, inh: 0, dap: 0, sxt: 0 },
     rec: o.rec || 0, pl: o.pl || 0, cas: o.cas || 0, cost: 1, pae: o.pae || 0, paeK: '', paeR: 0,
+    // Internal physiology: ribosome allocation, the stringent alarmone, chromosome replication,
+    // oxidative damage and the SOS response. A cell inoculated into fresh medium starts with the
+    // ribosome content of wherever it came from, which is what makes it lag.
+    phiR: o.phiR != null ? o.phiR : (o.lag ? PHI_R0 + 0.03 : 0.22),
+    ppgpp: o.ppgpp || 0, ox: o.ox || 0, sos: 0, uvHit: 0, rate: 1, ecl: 0,
+    ori: o.ori || 1, chr: o.chr || 1, rounds: o.rounds ? o.rounds.slice() : [], dna: o.dna || 1,
     tumbleT: 0, mem: NaN, dead: false, cause: '', root: 0, _k: 0 };
   if (o.g) for (const k in o.g) b.g[k] = o.g[k];
   b.root = o.root || b.id;
@@ -2443,11 +2449,23 @@ function divide(b, d) {
   if (d.shape === 'rod') { nL = b.L / 2; off = b.L / 4; }
   else { nL = b.L * 0.7937; off = nL / 2; }
   const c = makeBact(b.sp, b.x + ux * off, b.y + uy * off, { a: b.a + 0.05 * gauss(), gen: b.gen + 1, newborn: true, g: b.g, rec: b.rec, pl: b.pl, cas: b.cas, lys: b.lys, lysV: b.lysV, root: b.root });
-  c.L = c.Lb = nL; c.Ldiv = d.shape === 'rod' ? nL + d.dL * (1 + 0.1 * gauss()) : nL * 1.26 * (1 + 0.04 * gauss());
+  // How much the daughter will add before she divides in turn depends on how fast she is growing:
+  // a cell in rich medium adds more, and so is born larger next time round. For a rod, length and
+  // volume are proportional; for a coccus the division diameter is the cube root of the volume.
+  const sf = sizeFactor(b, d), sfL = Math.cbrt(sf);
+  c.rate = b.rate; c.mu = b.mu;
+  c.L = c.Lb = nL; c.Ldiv = d.shape === 'rod' ? nL + d.dL * sf * (1 + 0.1 * gauss())
+    : Math.max(nL * 1.06, d.Lb * sfL * 1.26 * (1 + 0.04 * gauss()));
   c.qs = b.qs; c.bio = b.bio; c.act = b.act; c.mem = b.mem; c.pae = b.pae; c.paeK = b.paeK; c.paeR = b.paeR;
+  // The daughters inherit the mother's physiology: her ribosomes, her alarmone, her damage. They
+  // also inherit the replication rounds she had in progress, which is how a fast-growing cell is
+  // born already copying its chromosome.
+  c.phiR = b.phiR; c.ppgpp = b.ppgpp; c.ox = b.ox; c.sos = b.sos;
+  splitReplication(b, c);
   if ((c.pl & 1) && rand() < 1e-4) c.pl &= ~1;            // segregational loss
   b.x -= ux * off; b.y -= uy * off; b.L = b.Lb = nL; b.gen++; b.born = S.t; b.a += 0.05 * gauss();
-  b.Ldiv = d.shape === 'rod' ? nL + d.dL * (1 + 0.1 * gauss()) : nL * 1.26 * (1 + 0.04 * gauss());
+  b.Ldiv = d.shape === 'rod' ? nL + d.dL * sf * (1 + 0.1 * gauss())
+    : Math.max(nL * 1.06, d.Lb * sfL * 1.26 * (1 + 0.04 * gauss()));
   if (d.shape !== 'rod') { const turn = rand() < 0.5 ? Math.PI / 2 : -Math.PI / 2; b.a += turn; c.a = b.a + (rand() < 0.5 ? 0 : Math.PI / 2); }
   mutate(b); mutate(c);
   S.bact.push(c); S.cnt.born++;
@@ -2513,7 +2531,10 @@ function chemAction(b, d, i, h) {
       continue;
     }
     let f = 1;
-    if (ch.gramPos) f *= d.gram > 0 ? 1 : (d.noWall ? 0.3 : 0.02);   // no way through an outer membrane
+    // No way through an outer membrane — but how little a way depends on the molecule. A small
+    // cationic dye still trickles across; a 3.4 kDa peptide essentially does not, which is why
+    // nisin's selectivity is thousandfold and a dye's is merely strong.
+    if (ch.gramPos) f *= d.gram > 0 ? 1 : (d.noWall ? 0.3 : (ch.gnLeak || 0.02));
     if (ch.key === 'tel' && (b.sp === 'sau' || b.sp === 'efa')) f *= 0.1;   // tellurite-reducing
     if (ch.key === 'tcs' && b.sp === 'pae') f *= 0.02;   // a FabI variant triclosan cannot bind
     if (ch.catalase && d.catalase) f *= 0.08;            // catalase destroys peroxide on contact
@@ -2522,8 +2543,11 @@ function chemAction(b, d, i, h) {
     if (ch.cationic && d.gram < 0) f *= 0.3 + 2.2 * permeable;
     // qac-type efflux: these two are famous for growing in the disinfectant bottle.
     if (ch.cationic && (b.sp === 'pae' || b.sp === 'kpn')) f *= 0.12;
-    // An anionic detergent is simply kept outside by lipopolysaccharide.
-    if (ch.anionic) f *= d.gram < 0 ? 0.02 + permeable : 1;
+    // An anionic detergent is simply kept outside by lipopolysaccharide. The exclusion is close to
+    // absolute — E. coli grows in 1% SDS — so what little leaks through has to be little enough
+    // that a tenfold excess over the EC50 still does nothing. Strip the layer with a chelator and
+    // the protection goes with it.
+    if (ch.anionic) f *= d.gram < 0 ? 0.001 + permeable : 1;
     // Chloride throws silver out of solution as silver chloride.
     if (ch.metal && FIELDS.nacl.active) f *= 1 / (1 + 1.5 * F.nacl[i]);
     if (b.spore === 2) f *= ch.spore;                    // spores: ethanol does nothing, bleach is slow
@@ -2537,6 +2561,21 @@ function chemAction(b, d, i, h) {
     if (ch.quench) F[k][i] = Math.max(0, c - c * 0.22 * h);
   }
   return { rate, inhib, worst };
+}
+// How hard this cell's wall is being attacked, as a fraction. Peptidoglycan under construction and
+// failing to cross-link is a leaky envelope, and anything that has to cross that envelope crosses
+// it more easily. Measured as a sum over the wall-active drugs present, each in units of its own
+// MIC for this cell, so a resistant cell is not sensitised by a drug it no longer feels.
+const WALL_DRUGS = ['amp', 'van', 'cro', 'mem'];
+const WALL_UPTAKE = 2.5;              // how much faster an aminoglycoside enters a damaged envelope
+function wallStress(b, i) {
+  let s = 0;
+  for (const k of WALL_DRUGS) {
+    if (!FIELDS[k].active) continue;
+    const c = F[k][i];
+    if (c > 1e-9) { const r = c / micOf(b, k); s += r / (r + 1); }
+  }
+  return Math.min(1, s);
 }
 // How much proton motive force the cell actually has at this spot. An uncoupler short-circuits the
 // gradient outright; azide stops the respiration that charges it in anything that breathes. The
@@ -2589,7 +2628,11 @@ function drugAction(b, d, i, eps, glc, o2) {
       // dependent phase simply does not run, and the drug stays outside. An uncoupled cell is
       // therefore almost fully protected, which is how the dependence was demonstrated.
       const pm = pmfFactor(i, d);
-      const pmf = (glc > 0.05 ? 1 : 0.15) * (o2 > 0.01 ? 1 : 0.1) * (pm < 0.3 ? pm * 0.01 : pm);
+      // A wall under attack also lets the drug in faster, and that is not a detail: it is why
+      // ampicillin and gentamicin are given together for enterococcal endocarditis, an infection
+      // neither drug cures alone at any dose a patient will tolerate.
+      const up = 1 + WALL_UPTAKE * wallStress(b, i);
+      const pmf = (glc > 0.05 ? 1 : 0.15) * (o2 > 0.01 ? 1 : 0.1) * (pm < 0.3 ? pm * 0.01 : pm) * up;
       f = b.dormant ? pmf * (glc > 0.05 ? 0.9 : 0.2) : pmf;
     }
     else f = 1;
@@ -2708,6 +2751,9 @@ function stepBact(b, h, ctx) {
   // Medium quality and iron. A rich broth supplies amino acids and nucleotides ready-made, so a
   // cell that would take an hour to double on minimal salts does it in twenty minutes. Iron is the
   // nutrient every host withholds on purpose, and the one most bacteria are closest to running out of.
+  // How fast this cell's chemistry runs, apart from how much food it has. Replication forks move at
+  // this rate too, which is what keeps cell size nearly constant across temperature.
+  b.rate = ctx.tf[b.sp] * ctx.pf[b.sp];
   let mu = d.mumax * ctx.tf[b.sp] * ctx.pf[b.sp] * sub * (d.photo ? 1 : oxF) * b.cost * ctx.rich * (d.noIron ? 1 : ctx.ironF);
   // An organism that has never been grown outside a host will not be grown here either. Its genome
   // has lost the biosynthesis it would need, and no medium on this bench supplies the difference.
@@ -2775,7 +2821,15 @@ function stepBact(b, h, ctx) {
     }
   }
   if (b.bio) mu *= 0.85;
-  if (b.lag > 0) { if (glc > d.Ks) b.lag -= h; mu *= 0.1; }   // lag: rebuilding ribosomes, only with food
+  // What the medium could support, before asking whether the cell is equipped to take it. The
+  // stringent response and the proteome are updated against this, and then growth is whichever of
+  // the two is smaller: a cell with too few ribosomes cannot use a rich medium until it builds them.
+  const nutrientMu = mu;
+  if (!physiologyStep(b, d, h, i, o2, nutrientMu)) return;
+  mu = Math.min(nutrientMu, ribosomeLimit(b) * b.cost);
+  // The old lag counter now only marks a cell as freshly inoculated; the lag itself emerges from
+  // having to build ribosomes before the medium can be used.
+  if (b.lag > 0) { if (glc > d.Ks) b.lag -= h; }
   if (ctx.anyDrug) {
     drugAction(b, d, i, eps, glc, o2);
     mu *= _inhib;
@@ -2867,6 +2921,17 @@ function stepBact(b, h, ctx) {
     else b.L = Math.cbrt(6 * (V + dV) / Math.PI);
     S.flux.bio += dV;                             // µm³ of new biomass, for the yield coefficient
   }
+  // The size a cell divides at was decided by how fast its mother was growing. If the medium has
+  // changed since, that target is wrong, and the cell corrects it — slowly, as a target rather than
+  // a jump. A culture shifted down therefore goes on dividing without growing much until its cells
+  // are as small as the new conditions call for. That is reductive division, and without it a cell
+  // too large for its growth rate would sit there accumulating chromosomes it never divided away.
+  if (!b.spore && !b.dormant) {
+    const tgt = d.shape === 'rod' ? b.Lb + d.dL * sizeFactor(b, d) : d.Lb * Math.cbrt(sizeFactor(b, d)) * 1.26;
+    b.Ldiv += (Math.max(b.Lb * 1.06, tgt) - b.Ldiv) * hazard(0.03, h);
+  }
+  // Replication is driven by mass, so it is advanced after the cell has grown.
+  replicationStep(b, d, h, V + Math.max(0, dV));
   b.mu = realized;
   // A fastidious organism runs out of reserves fast: outside its narrow conditions it does not
   // merely stop growing, it dies, which is why some specimens have to reach the laboratory warm.
@@ -2937,7 +3002,16 @@ function stepBact(b, h, ctx) {
       once('induce', VIR[b.lysV].name + ' prophage induced in ' + BACT[b.sp].abbr + ' #' + b.id + ': RecA* cleaved the repressor and the lytic program began.', 'evo');
     }
   }
-  if (b.L >= b.Ldiv && !b.spore && !b.dormant && !(b.inf && b.inf.lytic)) divide(b, d);
+  // A cell may only divide once it has a whole chromosome to give away, and not while SOS is
+  // strongly on, because SulA blocks the division ring. A cell that keeps growing without dividing
+  // becomes a filament, which is what DNA damage looks like down a microscope.
+  if (b.L >= b.Ldiv && !b.spore && !b.dormant && !(b.inf && b.inf.lytic)) {
+    if (b.sos > 0.45) {
+      if (b.L > b.Ldiv * 3.5) b.Ldiv = b.L;        // a filament cannot grow without end
+      once('filament', BACT[b.sp].abbr + ' is filamenting: the SOS response has blocked cell division while the DNA is repaired, so the cell keeps growing without splitting.', 'evo');
+    } else if (b.chr >= 2) divide(b, d);
+    else if (b.L > b.Ldiv * 2.2) { b.chr = 2; b.rounds.length = 0; divide(b, d); }   // never deadlock
+  }
   moveBact(b, d, h, ctx);
 }
 
@@ -3343,12 +3417,14 @@ const SP_KEYS = Object.keys(BACT), EUK_KEYS = Object.keys(EUK);
 function computeStats() {
   const st = { t: S.t, sp: {}, bact: 0, dormant: 0, spores: 0, lysogens: 0, infected: 0, qs: 0, bio: 0, res: 0, maxCipFold: 1, rp4: 0,
     vir: {}, euk: {}, hum: {}, neu: 0, mac: 0, phago: 0, cells: 0, humInf: 0, humDead: 0, humLatent: 0, epi: null,
-    mu: 0, growing: 0, vol: 0, dry: 0, gen: 0, len: 0, lenCV: 0, motile: 0, persist: 0, intra: 0, alleles: 0, rich: 0, H: 0, pae: 0, paeMax: 0 };
+    mu: 0, growing: 0, vol: 0, dry: 0, gen: 0, len: 0, lenCV: 0, motile: 0, persist: 0, intra: 0, alleles: 0, rich: 0, H: 0, pae: 0, paeMax: 0,
+    phiR: 0, ppgpp: 0, dna: 0, ox: 0, sos: 0, sosOn: 0, multifork: 0 };
   for (const k of SP_KEYS) st.sp[k] = 0;
   for (const k of EUK_KEYS) st.euk[k] = 0;
   for (const k of HUM_KEYS) st.hum[k] = 0;
   // One pass does all of it: the aggregates below are free riders on a loop we already run.
   let muS = 0, muN = 0, lenS = 0, lenQ = 0, allS = 0;
+  let phiS = 0, ppgS = 0, dnaS = 0, oxS = 0, sosS = 0;
   const roots = {};
   for (const b of S.bact) {
     st.sp[b.sp]++; st.bact++;
@@ -3363,6 +3439,9 @@ function computeStats() {
     st.vol += vol(b, BACT[b.sp]);
     st.gen += b.gen || 0;
     lenS += b.L; lenQ += b.L * b.L;
+    phiS += b.phiR || 0; ppgS += b.ppgpp || 0; dnaS += b.dna || 1; oxS += b.ox || 0; sosS += b.sos || 0;
+    if (b.sos > 0.45) st.sosOn++;
+    if (b.ori > 2) st.multifork++;
     roots[b.root] = (roots[b.root] || 0) + 1;
     if (b.spore !== 2) { muS += b.mu; muN++; if (b.act > 0.3) st.growing++; }
   }
@@ -3378,6 +3457,8 @@ function computeStats() {
     const vr = lenQ / st.bact - st.len * st.len;       // length CV: how synchronous the culture is
     st.lenCV = st.len > 0 && vr > 0 ? Math.sqrt(vr) / st.len : 0;
     st.alleles = allS / st.bact;                       // mean resistance alleles per cell
+    st.phiR = phiS / st.bact; st.ppgpp = ppgS / st.bact;
+    st.dna = dnaS / st.bact; st.ox = oxS / st.bact; st.sos = sosS / st.bact;
   }
   for (const v in VIR) st.vir[v] = FIELDS[v].active ? fieldSum(v) : 0;
   st.hap = st.dip = st.hyph = st.blast = 0;
@@ -4499,6 +4580,199 @@ function crowded(c, d) {
     if (dx * dx + dy * dy < rr) { n++; if (n >= 6) return true; }
   }
   return false;
+}
+
+// ===== SECTION: WHAT IS GOING ON INSIDE A CELL =====
+// Until now a bacterium was a size, a genotype and a growth rate. These are the internal variables
+// that actually set that growth rate, and they have their own dynamics — which is why a culture
+// moved to fresh medium does not simply start growing, and why a cell dividing every twenty minutes
+// contains more than one chromosome's worth of DNA.
+
+// ---- proteome allocation: the bacterial growth law ----
+// A cell divides its protein budget between ribosomes and everything else. More ribosomes means
+// faster translation and faster growth; but ribosomes are themselves protein, so the fraction spent
+// on them cannot grow without limit. Scott et al. (2010) measured the relation and found it linear:
+// the ribosomal fraction rises in proportion to growth rate, from an offset of about 7% at zero.
+// Reading it the other way round — growth rate is set by how many ribosomes the cell has built —
+// is what makes lag phase a mechanism rather than a delay.
+const PHI_R0 = 0.07;              // ribosomal protein fraction extrapolated to zero growth
+const PHI_R_MAX = 0.55;           // the ceiling: a cell cannot be made only of ribosomes
+const TRANSL = 4.2;               // h⁻¹ per unit of ribosomal fraction, from the measured slope
+// The growth rate this cell could sustain with the ribosomes it currently has.
+function ribosomeLimit(b) {
+  return Math.max(0, TRANSL * (b.phiR - PHI_R0)) / 60;     // per minute
+}
+// Where the cell would like its ribosomal fraction to be, given how good the medium is. Richer
+// nutrients justify more ribosomes; starvation justifies almost none, and ppGpp enforces that.
+function targetPhiR(nutrientMu, d) {
+  const want = PHI_R0 + 60 * nutrientMu / TRANSL;
+  return clamp(want, PHI_R0, PHI_R_MAX);
+}
+// ---- the stringent response ----
+// When a ribosome stalls for want of a charged tRNA, RelA makes ppGpp. It is the signal that the
+// cell is short of building blocks: ribosome synthesis stops, stress and survival genes come on,
+// and the cell stops committing to growth it cannot finish. It is also the switch that makes
+// persisters.
+function stringentStep(b, d, h, nutrientMu) {
+  // Demand outruns supply when the ribosomes the cell has built cannot be fed.
+  const starving = clamp(1 - nutrientMu / Math.max(1e-9, ribosomeLimit(b) + 1e-9), 0, 1);
+  const target = clamp(starving, 0, 1);
+  b.ppgpp += (target - b.ppgpp) * hazard(0.08, h);
+  return b.ppgpp;
+}
+// ---- chromosome replication: Cooper and Helmstetter, 1968 ----
+// Replicating the chromosome takes a fixed time, C, and a further fixed time D passes before the
+// cell divides. If the doubling time is shorter than C + D — and for E. coli in rich medium it is,
+// twenty minutes against sixty — then the cell must start the next round of replication before it
+// has finished this one. The result is multifork replication: a fast-growing cell is born with
+// replication already in progress and contains well over one chromosome's worth of DNA.
+// How long a chromosome takes to copy is set by the genome and the polymerase, not by how fast the
+// cell happens to be growing. Two forks leave oriC in opposite directions at about a thousand bases
+// a second each, so the time is the genome divided by twice that. For E. coli's 4.6 megabases it
+// comes to forty minutes — nearly twice the doubling time in rich broth, which is the whole reason
+// a fast cell is polyploid. For Mycoplasma's 0.8 megabases it is seven minutes against a doubling
+// time of hours, so that organism is haploid and never overlaps a round. The same two constants
+// give both answers, which is what tells you they are the right constants.
+const FORK_KB_MIN = 60;             // one replication fork, in kilobases a minute
+const D_PERIOD = 20;                // minutes from the last base copied to the septum closed
+function genomeMb(d) { const g = GENOMES[d.key]; return g ? g[0] : 4.0; }
+function cNominal(d) { return clamp(1000 * genomeMb(d) / (2 * FORK_KB_MIN), 5, 200); }
+// A fork moves by polymerase chemistry, so cooling the culture slows replication by the same factor
+// it slows everything else. This is why cell size and DNA content barely change between 25 and
+// 37 °C although growth rate halves (Trueba et al. 1982), while changing the medium at constant
+// temperature changes both a great deal: nutrients slow µ without slowing the fork.
+function metabolicRate(b) { return clamp(b.rate == null ? 1 : b.rate, 0.08, 1.4); }
+function cPeriod(b, d) { return cNominal(d) / metabolicRate(b); }
+function dPeriod(b, d) { return D_PERIOD / metabolicRate(b); }
+// How many doublings fit between an initiation and the division it causes, when the organism is
+// growing as fast as it can. It is the reference the size law is measured against, and it is above
+// one only for the organisms fast enough to need overlapping rounds.
+function cdRef(d) { return (cNominal(d) + D_PERIOD) / d.td; }
+// ---- cell size is set by growth rate ----
+// Schaechter, Maaløe and Kjeldgaard (1958) grew Salmonella in media of every quality and found
+// that average cell mass rises exponentially with growth rate: cells doubling every 20 minutes are
+// nearly three times the mass of cells doubling every hour. Donachie saw why it followed from the
+// scheme above. If initiation happens at a fixed mass per origin and a fixed C + D separates
+// initiation from division, then the size at birth must be that initiation mass doubled once for
+// every generation that fits inside C + D. Faster growth packs more generations in, so the cell is
+// larger — and carries more DNA, for exactly the same reason.
+function sizeFactor(b, d) {
+  const dbl = Math.max(0, b.mu || 0) / LN2;              // doublings per minute as it is growing
+  return clamp(Math.pow(2, dbl * (cPeriod(b, d) + dPeriod(b, d)) - cdRef(d)), 0.4, 1.4);
+}
+// Donachie's constant. Initiation happens at a fixed mass per origin whatever the medium, and for
+// E. coli that mass is about a quarter of a cubic micrometre of cell per origin. Writing it as a
+// fraction of the species' own nominal birth volume carries the same rule to organisms of other
+// sizes. Everything else about the cell cycle follows from this number and from C and D: it is what
+// makes a cell in rich broth large and polyploid and one on minimal salts small and haploid.
+// Published estimates for E. coli span roughly 0.3 to 0.9 µm³ per origin depending on strain and
+// method; this value is the one that makes the per-cell fork bookkeeping below reproduce the DNA
+// content Cooper and Helmstetter's closed form gives for the same C, D and doubling time, which is
+// the quantity actually measured from DNA histograms.
+const INIT_MASS_FRAC = 0.37;
+function initiationVolume(b, d) {
+  const Vb = d.shape === 'rod' ? rodVol(d.Lb, d.w) : Math.PI * d.Lb * d.Lb * d.Lb / 6;
+  return Vb * INIT_MASS_FRAC;
+}
+const ORI_CAP = 32;                 // a fast E. coli carries eight; this is a guard rail, not a model
+const ECLIPSE = 0.3;                // fraction of C for which a copied origin stays sequestered
+// A round of replication is not one fork pair but however many origins fired together, each copying
+// a chromosome in the same C minutes. Counting them is the difference between a DNA content that
+// matches Cooper and Helmstetter's arithmetic and one that runs away: n forks copying in parallel
+// add n genome equivalents between them, not n times what one of them adds.
+function replicationStep(b, d, h, V) {
+  const C = cPeriod(b, d);
+  // The eclipse. A freshly copied origin is sequestered by SeqA and cannot fire again for a while,
+  // which is the only thing standing between a cell and runaway initiation: without it, mass alone
+  // would licence another round on the very next step, and the next, until the chromosome count ran
+  // away. With it, initiations come in one synchronous burst per cycle, which is what is observed.
+  if (b.ecl > 0) b.ecl -= h;
+  // Initiation: every origin in the cell fires at once, when there is mass enough per origin.
+  if (b.ecl <= 0 && b.ori < ORI_CAP && V >= initiationVolume(b, d) * b.ori) {
+    b.rounds.push({ n: b.ori, p: 0 });
+    b.ori *= 2;
+    b.ecl = ECLIPSE * C;
+  }
+  // Each round advances at the fork's own speed, which does not depend on how many are running.
+  let prog = 0;
+  for (let k = b.rounds.length - 1; k >= 0; k--) {
+    const r = b.rounds[k];
+    r.p += h / C;
+    if (r.p >= 1) { b.chr += r.n; b.rounds.splice(k, 1); }
+    else prog += r.n * r.p;
+  }
+  b.dna = b.chr + prog;                   // genome equivalents, which is what a DNA stain reads
+}
+// Division halves everything: the finished chromosomes, the origins on them, and the forks still
+// running — each daughter keeps the replication it inherits on its own copy. A single round cannot
+// be halved, so it goes to one daughter and the other is born with none.
+function splitReplication(b, c) {
+  const mine = [], hers = [];
+  for (const r of b.rounds) {
+    if (r.n >= 2) { mine.push({ n: r.n / 2, p: r.p }); hers.push({ n: r.n / 2, p: r.p }); }
+    else (rand() < 0.5 ? mine : hers).push({ n: 1, p: r.p });
+  }
+  b.rounds = mine; c.rounds = hers; c.ecl = b.ecl;
+  b.chr = Math.max(1, b.chr / 2); c.chr = Math.max(1, b.chr);
+  b.ori = Math.max(1, b.ori / 2); c.ori = Math.max(1, b.ori);
+  let pb = 0, pc = 0;
+  for (const r of mine) pb += r.n * r.p;
+  for (const r of hers) pc += r.n * r.p;
+  b.dna = b.chr + pb; c.dna = c.chr + pc;
+}
+// ---- oxidative damage ----
+// Respiration leaks electrons onto oxygen and makes superoxide, so aerobic life carries a running
+// repair bill. Catalase and superoxide dismutase pay most of it; peroxide, ultraviolet and the
+// radicals released by some drugs add to it faster than the repair can keep up.
+function oxidativeStep(b, d, h, i, o2) {
+  // The leak from the cell's own respiratory chain is dealt with by superoxide dismutase and
+  // peroxidases, which every organism that tolerates air possesses: a catalase-negative
+  // streptococcus grows in air perfectly well, and an aerotolerant anaerobe does too. What catalase
+  // is for is peroxide arriving from outside, faster than a peroxidase can turn it over — which is
+  // exactly why the test for it is a drop of peroxide and a look for bubbles.
+  let load = 0.0025 * (o2 / (o2 + 0.01)) * (0.2 + 0.8 * b.act);
+  if (FIELDS.h2o2.active) { const c = F.h2o2[i]; if (c > 1e-6) load += (d.catalase ? 0.03 : 0.15) * c / (c + 0.5); }
+  // The stringent response turns the oxidative stress genes on, so a cell that has stopped growing
+  // defends itself better than one that has not. It is part of why stationary phase is hard to kill.
+  const repair = 0.008 * (1 + 0.6 * b.ppgpp) * (d.catalase ? 1 : 0.85);
+  b.ox = Math.max(0, b.ox + (load - repair) * h);
+  if (b.ox > 1.4 && rand() < hazard(0.01 * (b.ox - 1.4), h)) {
+    killBact(b, 'killed by accumulated oxidative damage', 'die');
+    once('oxdeath', 'Oxidative damage has outrun the repair. Every aerobe runs this balance — superoxide leaks from the respiratory chain continuously — and catalase-negative organisms run it much closer to the edge.', 'bad');
+    return true;
+  }
+  return false;
+}
+// ---- the SOS response ----
+// RecA coated on single-stranded DNA cleaves the LexA repressor and a few dozen genes come on at
+// once: excision repair, recombination, error-prone polymerases, and a halt to division. It is
+// both how a cell survives DNA damage and how it acquires mutations while doing so.
+function sosStep(b, d, h, i) {
+  let damage = 0;
+  // A quinolone leaves double-strand breaks wherever it traps a gyrase, so SOS is strongly induced
+  // well below the MIC — recA reporter assays see it at a tenth of it, and saturate near the MIC.
+  if (FIELDS.cip.active) { const r = F.cip[i] / micOf(b, 'cip'); damage += r / (r + 0.25); }
+  if (FIELDS.ntf.active) { const c = F.ntf[i]; damage += 0.5 * c / (c + 8); }
+  if (b.ox > 0.5) damage += 0.3 * (b.ox - 0.5);
+  if (b.uvHit > 0) { damage += b.uvHit; b.uvHit = Math.max(0, b.uvHit - h * 0.02); }
+  b.sos += (clamp(damage, 0, 1) - b.sos) * hazard(0.05, h);
+  // While SOS is strongly on, the cell stops dividing and filaments instead: SulA blocks the
+  // division ring, so the cell keeps growing without splitting. A long filament under a microscope
+  // is a cell that has been through DNA damage.
+  return b.sos;
+}
+// Everything above, run once per cell per step, before growth is committed. Returns false if the
+// cell died.
+function physiologyStep(b, d, h, i, o2, nutrientMu) {
+  stringentStep(b, d, h, nutrientMu);
+  // Ribosome synthesis is what ppGpp shuts off, so the target the cell aims at is suppressed by it.
+  const target = targetPhiR(nutrientMu, d) * (1 - 0.85 * b.ppgpp);
+  // Ribosomes are built by ribosomes, so the approach to a new allocation is itself growth-limited.
+  const rate = hazard(0.02 + 0.9 * Math.max(0, ribosomeLimit(b)), h);
+  b.phiR += (Math.max(PHI_R0, target) - b.phiR) * rate;
+  if (oxidativeStep(b, d, h, i, o2)) return false;
+  sosStep(b, d, h, i);
+  return true;
 }
 
 // ===== SECTION: RENDERING =====
@@ -6843,6 +7117,127 @@ const SCEN5 = [
 ];
 for (const s of SCEN5) { SCENARIOS.splice(SCENARIOS.length - 1, 0, s); SCN[s.id] = s; }
 
+// ===== SECTION: EXPERIMENTS, PART SIX =====
+// Three experiments about what is going on inside a cell rather than around it: the ribosomes that
+// decide how fast it can grow, the chromosome it has to finish copying before it can divide, and
+// the question of where a resistant mutant comes from.
+const SCEN6 = [
+  {
+    id: 'shiftup', title: 'The nutritional shift-up', teaches: 'The bacterial growth law: why a culture cannot simply start growing',
+    limit: 300, speed: 3,
+    brief: '<p>A hundred <i>E. coli</i>, scraped off a plate into minimal salts at room temperature. They will grow, slowly, and they will build only as many ribosomes as that slow growth justifies.</p>' +
+      '<p>Growing fast means translating fast, and translating fast means owning ribosomes — which are themselves a quarter of the protein a fast cell contains. A cell will not pay for machinery it cannot feed, so the ribosomal fraction sits wherever the medium puts it. Improve the medium and the cell commits to more; the growth rate then climbs as the ribosomes arrive, not the instant the food does. That delay is lag phase, and it is a construction project rather than a wait.</p>' +
+      '<p>Find the conditions that make this culture build ribosomes, and watch the growth rate follow the ribosomal fraction up. The notebook plots the two together.</p>',
+    goal: 'Get the population past 600 cells, with the mean ribosomal proteome fraction above 0.40 — which no poor medium will support.',
+    short: 'Make the culture worth building ribosomes for',
+    labnote: '<b>Scott and colleagues measured this in 2010</b> and found it embarrassingly simple: the fraction of a bacterium\'s protein that is ribosome rises in a straight line with growth rate, φR = 0.07 + µ/4.2, with µ in doublings per hour. The offset is the ribosomes a cell keeps even when not growing; the slope is how fast a ribosome can make protein. Read the line the other way and it stops being a correlation and becomes a mechanism: a cell grows at the rate its ribosomes allow, so lag phase is not a cell waiting, it is a cell building. Starve the culture again and ppGpp shuts ribosome synthesis off within seconds, which is why the second lag is as long as the first.',
+    tools: { specimens: ['eco'], drugs: [], pipette: ['glc'], cond: ['T', 'pH', 'feed', 'rich'] },
+    setup() {
+      Object.assign(S.env, { medium: 'liquid', T: 25, o2Mode: 'kla', kla: 90, rich: 0.55 });
+      setCarbon(10);
+      S.env.glcTarget = 10; S.env.glcRate = 0.03;
+      // Straight out of starvation: ribosome-poor, which is the whole premise.
+      for (let k = 0; k < 100; k++) spawnBact('eco', 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1, phiR: PHI_R0 + 0.01, lag: 1 });
+      S.histDt = 2;
+    },
+    metric(st) {
+      return { v: st.bact, target: 600, frac: clamp(st.bact / 600, 0, 1) * (st.phiR > 0.4 ? 1 : 0.5),
+        text: st.bact + ' / 600 cells · φR ' + st.phiR.toFixed(3) + ' · µ ' + (60 * st.mu).toFixed(2) + ' h⁻¹' };
+    },
+    check(st) {
+      if (st.bact >= 600 && st.phiR > 0.4) return 'win';
+      if (st.bact < 10) return 'lose';
+      return S.t >= this.limit ? 'lose' : null;
+    },
+    stars() { return starsFor(S.t, 150, 220); },
+    series: [{ key: 'phiR', label: 'ribosomal fraction φR', col: 'sp-gpos', get: st => st.phiR },
+      { key: 'mu', label: 'µ (h⁻¹)', col: 'sp-gneg', get: st => 60 * st.mu },
+      { key: 'ppgpp', label: 'ppGpp', col: 'sp-anaer', get: st => st.ppgpp }],
+    solve: [{ t: 1, run() { S.env.T = 37; S.env.rich = 1; feedCarbon(8); } }, { t: 90, run() { feedCarbon(8); } }],
+  },
+  {
+    id: 'ploidy', title: 'More than one chromosome', teaches: 'Cooper–Helmstetter replication, and why a fast cell is polyploid',
+    limit: 420, speed: 3,
+    brief: '<p>Copying the <i>E. coli</i> chromosome takes about forty minutes, and another twenty pass before the cell divides. In rich broth the same cell divides every twenty-five minutes. Those numbers do not fit, and the way out of the contradiction is stranger than it looks: the cell starts copying the next chromosome before it has finished this one.</p>' +
+      '<p>The consequence is measurable. A fast-growing cell contains three or four chromosomes\' worth of DNA, carries eight copies of the origin, and was born with replication already running. The culture in front of you is not that: it is starved of carbon, dividing more slowly than it can copy a chromosome, and so its cells are small and carry one genome each.</p>' +
+      '<p>Only one kind of change will drive it into overlap. Cooling or warming the culture will not, because a polymerase slows down with everything else in the cell — the forks keep pace with the growth and nothing overlaps. Feeding it will, because food speeds the cell up without speeding the fork up at all. Run the flow cytometer on the Cytometry tab before and after, and compare the DNA histograms.</p>',
+    goal: 'Hold a culture of at least 400 cells whose mean DNA content is above 3 genome equivalents, with at least half of them replicating more than one round at once.',
+    short: 'Drive the culture into multifork replication',
+    labnote: '<b>Cooper and Helmstetter worked this out in 1968</b> from the rate at which labelled thymidine appeared in DNA, and the arithmetic has held up. Call the copying time C and the gap before division D. If the doubling time τ is shorter than C + D, the division happening now was set in motion by an initiation that happened more than a generation ago — so the cell must have been carrying those forks since before it was born. The average DNA per cell works out to (τ/C ln2)(2^((C+D)/τ) − 2^(D/τ)), which for rich-medium <i>E. coli</i> comes to between three and four genomes. Donachie saw the following year why it holds together: initiation happens at a fixed mass per origin, so the size at birth adjusts itself to whatever the growth rate demands. Cool the culture and nothing changes, because a polymerase slows down with everything else; starve it and everything changes, because nutrients slow the cell without slowing the fork.',
+    tools: { specimens: ['eco'], drugs: [], pipette: ['glc'], cond: ['T', 'feed', 'rich', 'o2', 'kla'] },
+    setup() {
+      // Carbon-limited on purpose: held just at the half-saturation constant, so the cell is short
+      // of food rather than short of heat. Temperature is already at the optimum, which is the trap.
+      Object.assign(S.env, { medium: 'liquid', T: 37, o2Mode: 'kla', kla: 90, rich: 0.55 });
+      setCarbon(0.02);
+      reservoir('glc', new Float32Array(NG).fill(0.02), 0.08);
+      for (let k = 0; k < 120; k++) spawnBact('eco', 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1, phiR: 0.12 });
+      // An inoculum already adapted to the starvation it is in: small cells, one chromosome each,
+      // nothing in progress. Seeding full-sized cells would mean watching them shrink for an hour
+      // first, which is a real thing cells do but not the thing this experiment is about.
+      const de = BACT.eco;
+      for (const b of S.bact) {
+        b.Lb = de.Lb * 0.6; b.Ldiv = b.Lb + de.dL * 0.45;
+        b.L = b.Lb + (b.Ldiv - b.Lb) * rand();
+        b.ori = 1; b.chr = 1; b.rounds.length = 0; b.dna = 1; b.ecl = 0;
+      }
+      S.histDt = 2;
+    },
+    metric(st) {
+      const frac = st.bact ? st.multifork / st.bact : 0;
+      return { v: st.dna, target: 3, frac: clamp(st.dna / 3, 0, 1) * (st.bact >= 400 ? 1 : 0.5),
+        text: st.dna.toFixed(2) + ' / 3 genome equivalents · ' + st.multifork + ' of ' + st.bact +
+          ' multifork (' + (100 * frac).toFixed(0) + '%) · ' + st.bact + ' cells' };
+    },
+    check(st) {
+      if (st.bact >= 400 && st.dna > 3 && st.multifork >= st.bact / 2) return 'win';
+      if (st.bact < 10) return 'lose';
+      return S.t >= this.limit ? 'lose' : null;
+    },
+    stars() { return starsFor(S.t, 200, 320); },
+    series: [{ key: 'dna', label: 'DNA (genome eq)', col: 'sp-gneg', get: st => st.dna },
+      { key: 'mf', label: 'multifork cells', col: 'sp-gpos', get: st => st.multifork },
+      { key: 'mu', label: 'µ (h⁻¹)', col: 'sp-anaer', get: st => 60 * st.mu }],
+    solve: [{ t: 1, run() { S.env.T = 37; S.env.rich = 1; S.env.kla = 120; feedCarbon(14); } },
+      { t: 60, run() { feedCarbon(10); } }, { t: 120, run() { feedCarbon(10); } }, { t: 180, run() { feedCarbon(10); } }],
+  },
+  {
+    id: 'fluctuation', title: 'Where a mutant comes from', teaches: 'The Luria–Delbrück experiment, and how a mutation rate is measured',
+    limit: 240, speed: 3,
+    brief: '<p>In 1943 nobody could say whether bacteria had genes in the ordinary sense. A culture challenged with a phage or a drug always yielded a few survivors, and there were two explanations. Either the challenge taught the cells to resist, or the resistant cells were already there, made by mutations during the growth beforehand.</p>' +
+      '<p>Luria and Delbrück found a way to tell. Grow many small cultures separately and challenge each one on its own. If the challenge causes resistance, every culture had the same chance and the counts will scatter like a Poisson distribution — variance equal to mean. But if mutations happen at random during growth, then one that happened early is inherited by every descendant, and that culture yields a jackpot while its neighbours yield nothing. The variance then dwarfs the mean.</p>' +
+      '<p>The experiment is in the data notebook, on the Assays tab. Run it, look at the bars, and read off the mutation rate from how many cultures came up empty.</p>',
+    goal: 'Run the fluctuation test and obtain a variance-to-mean ratio above 2.5 — four standard errors above the 1.0 a Poisson process gives with sixteen cultures.',
+    short: 'Tell inherited mutation from induced resistance',
+    labnote: '<b>This is one of the few experiments that settled a question outright</b>, and it did so with arithmetic rather than apparatus. Luria later said the idea came to him watching a slot machine: most pulls give nothing and one gives a jackpot, which is exactly the signature of a rare event that gets amplified by everything that happens after it. The same reasoning gives a mutation rate without ever seeing a mutation: if the number of mutational events per culture is Poisson with mean m, the fraction of cultures with none is e^−m, so m is minus the log of that fraction, and dividing by the final population gives a rate per cell per division. It also carries a warning that still applies — the mean of such a distribution is nearly useless, because one jackpot culture dominates it. The sixteen cultures here are grown in a mutator background, since a field of hundreds of cells cannot host the events a flask of a hundred million would; the shape of the distribution is the result, and the shape does not depend on the rate.',
+    tools: { specimens: ['eco'], drugs: ['cip', 'amp', 'gen'], pipette: ['glc'], cond: ['T', 'feed', 'mut'] },
+    setup() {
+      Object.assign(S.env, { medium: 'liquid', T: 37, o2Mode: 'kla', kla: 90, mutAmp: 1e4 });
+      setCarbon(12);
+      S.env.glcTarget = 12; S.env.glcRate = 0.03;
+      for (let k = 0; k < 150; k++) spawnBact('eco', 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1, phiR: 0.4 });
+      S.histDt = 2;
+      S.fluct = null;
+    },
+    metric() {
+      const f = S.fluct;
+      if (!f) return { v: 0, target: 2.5, frac: 0, text: 'no fluctuation test run yet — Data notebook, Assays tab' };
+      return { v: f.vmr || 0, target: 2.5, frac: clamp((f.vmr || 0) / 2.5, 0, 1),
+        text: 'variance/mean ' + (f.vmr == null ? '—' : f.vmr.toFixed(1)) + ' of 2.5 · counts ' + f.counts.join(', ') };
+    },
+    check() {
+      const f = S.fluct;
+      if (f && f.vmr != null && f.vmr > 2.5) return 'win';
+      return S.t >= this.limit ? 'lose' : null;
+    },
+    stars() { return starsFor(S.t, 40, 100); },
+    series: [{ key: 'res', label: 'resistant cells', col: 'sp-gpos', get: st => st.res },
+      { key: 'bact', label: 'E. coli', col: 'sp-gneg', get: st => st.sp.eco }],
+    solve: [{ t: 2, run() { fluctuationTest('cip', 8); } }],
+  },
+];
+for (const s of SCEN6) { SCENARIOS.splice(SCENARIOS.length - 1, 0, s); SCN[s.id] = s; }
+
 // ===== SECTION: UI STATE & HELPERS =====
 const $ = id => document.getElementById(id);
 const SPEEDS = [1, 10, 60, 300, 1200, 3600];
@@ -6884,6 +7279,13 @@ const CATALOG = [
 const CAT = {}; CATALOG.forEach(g => g.items.forEach(it => CAT[it.key] = it));
 const GLOSS = {
   MIC: ['Minimum inhibitory concentration', 'The lowest drug concentration that stops visible growth of a standard inoculum overnight. Killing rises with multiples of the MIC.'],
+  phiR: ['φR — ribosomal proteome fraction', 'The share of a cell\'s protein that is ribosome. It rises in a straight line with growth rate, φR = 0.07 + µ/4.2 with µ in doublings per hour (Scott et al. 2010), and read backwards it is what sets the growth rate: a cell cannot grow faster than its ribosomes allow.'],
+  ppGpp: ['ppGpp', 'Guanosine tetraphosphate, the alarmone of the stringent response. A ribosome stalling for want of a charged tRNA makes it, and it shuts ribosome synthesis down within seconds. The signal that the cell is short of building blocks, and the switch behind persistence.'],
+  CD: ['C and D periods', 'C is the time to copy the chromosome — about forty minutes for E. coli, set by the genome length and the fork speed, not by how fast the cell is growing. D is the twenty minutes from the last base copied to the septum closing. When the doubling time is shorter than C + D, rounds of replication must overlap.'],
+  multifork: ['Multifork replication', 'More than one round of chromosome replication running in the same cell at once. The consequence of a doubling time shorter than C + D, and the reason a fast-growing bacterium contains three or four genome equivalents of DNA and eight copies of its origin.'],
+  initmass: ['Initiation mass', 'The cell mass per origin at which replication starts — a constant, whatever the medium (Donachie 1968). It is what makes cell size at birth track growth rate, and so what makes the whole replication scheme work across media.'],
+  SOS: ['SOS response', 'The programme induced by DNA damage: RecA coated on single-stranded DNA cleaves the LexA repressor and several dozen genes come on, including error-prone polymerases and SulA, which blocks division. A cell under it grows without dividing and becomes a filament.'],
+  FIC: ['FIC index', 'Fractional inhibitory concentration index, read off a checkerboard. The inhibitory concentration of each drug in combination, divided by its MIC alone, summed. One means purely additive — nothing gained. At or below a half is called synergy; above four, antagonism.'],
   MOI: ['Multiplicity of infection', 'Virions per host cell. Infections follow Poisson statistics, so at MOI 1 about 37% of cells receive none.'],
   CFU: ['Colony-forming units', 'Viable cells that can each grow into a colony. This field is 1.5 nL, so 1 cell here ≈ 6.5×10⁵ CFU/mL.'],
   lag: ['Lag phase', 'The pause after transfer to fresh medium while cells rebuild ribosomes and enzymes. Longer for cells from old cultures.'],
@@ -7871,6 +8273,15 @@ function openHelp() {
     '<li><b>The focal plane is a slice.</b> The field is ten micrometres deep and a lens holds only part of that in focus at once — less as the numerical aperture rises, because depth of field falls as the square of it. The objective that resolves two hundred nanometres holds barely half a micrometre in focus. Move the plane and different cells sharpen, which is why a thick specimen can never be sharp all the way through.</li>' +
     '<li><b>Tracking needs a fast enough camera.</b> Turning on tracks follows up to forty-eight organisms and draws where each has been. It only works at 1× or 10× playback: faster than that and a whole run happens between two samples, so the line joining them would be a fiction rather than a path. At a usable speed the run-and-tumble pattern is unmistakable — straight runs broken by sharp random turns.</li>' +
     '<li><b>Colour modes are data, not optics.</b> Live/dead shows what a membrane-integrity stain would show, and marks in amber the cells that are intact but dormant — the ones that stain live and plate as nothing. Metabolic activity ramps each cell by how hard it is working. Cell cycle colours each by phase, which is how the mitotic index is counted.</li></ul>' +
+    '<h3>Inside a bacterium</h3><ul class="note" style="margin:0 0 14px;padding-left:18px;line-height:1.6;max-width:72ch">' +
+    '<li><b>Growth rate is not a property of the medium.</b> It is a property of the cell, and what sets it is how much of the cell is ribosome. Scott and colleagues measured the relation in 2010 and found a straight line: φR = 0.07 + µ/4.2, with µ in doublings per hour. The offset is what a cell keeps when not growing; the slope is how fast a ribosome makes protein. Read backwards it becomes a mechanism — the cell grows at the rate its ribosomes allow — and lag phase stops being a delay and becomes a construction project. A culture out of starvation has to build ribosomes with the few ribosomes it has, and the growth rate climbs as they arrive. φR is on the readouts, in the time series and in the distributions.</li>' +
+    '<li><b>ppGpp is the switch that turns it off.</b> When a ribosome stalls for want of a charged tRNA, RelA makes the alarmone, ribosome synthesis stops within seconds, and the cell stops committing to growth it cannot finish. Starve a culture and watch ppGpp go to one and φR fall. It is also why a second lag is as long as the first, and part of why stationary-phase cells are hard to kill.</li>' +
+    '<li><b>A fast cell carries more than one chromosome.</b> Copying the <span class="sp-name">E. coli</span> chromosome takes about forty minutes — two forks leaving the origin in opposite directions at a thousand bases a second each — and another twenty pass before the cell divides. In rich broth that cell divides every twenty-five minutes. The only way out is to start the next round before finishing the last, so a fast cell is born with replication already running and contains three or four genomes\' worth of DNA. Cooper and Helmstetter worked this out in 1968, and their closed form for the average, (τ/C ln2)(2^((C+D)/τ) − 2^(D/τ)), is what the flow cytometer here is checked against.</li>' +
+    '<li><b>Donachie\'s constant holds it together.</b> Initiation happens at a fixed mass per origin, whatever the medium — about a third of a cubic micrometre of cell per origin. That one number makes the size at birth adjust itself to whatever the growth rate demands, which is why Schaechter, Maaløe and Kjeldgaard found in 1958 that cell mass rises exponentially with growth rate. A freshly copied origin is then sequestered for a while and cannot fire again, which is the only thing standing between a cell and runaway initiation.</li>' +
+    '<li><b>Temperature and food are not the same lever.</b> Cool a culture and the growth rate halves, but the replication forks slow by the same factor, so the same number of generations still fits into C + D and the cells keep their size and their DNA content. Starve it instead and the growth rate halves while the forks keep their speed, so the overlap disappears and the cells become small and haploid. Measured as how much volume moves per unit of growth rate, the two levers differ in sign. Trueba and colleagues showed this in 1982, and it is the one result most likely to surprise you at the bench.</li>' +
+    '<li><b>A cell that shifts down divides without growing.</b> The size it was going to divide at was decided by how fast its mother was growing. If the medium has since got worse, that target is wrong, and the cell corrects it by dividing through its excess until its daughters are as small as the new conditions call for.</li>' +
+    '<li><b>DNA damage stops division, and that is visible.</b> RecA on single-stranded DNA cleaves the LexA repressor and several dozen genes come on at once: repair, recombination, error-prone polymerases, and SulA, which blocks the division ring. The cell goes on growing and does not split, so it becomes a filament. Sub-MIC ciprofloxacin is the cleanest way to see it — a quarter of the MIC leaves the cells growing and turns SOS fully on, and they reach four or five times their normal length. Push the dose above the MIC and the filaments vanish, because a cell that cannot grow cannot elongate either.</li>' +
+    '<li><b>Aerobic life runs a repair bill.</b> Electrons leak from the respiratory chain onto oxygen continuously, and superoxide dismutase and the peroxidases pay for it — which is why a catalase-negative streptococcus grows in air perfectly well. What catalase is for is peroxide arriving from outside faster than a peroxidase can turn it over, and that is exactly why the test for it is a drop of peroxide and a look for bubbles. Put 0.3% peroxide on an enterococcus and on <span class="sp-name">E. coli</span> and the damage readout separates them tenfold.</li></ul>' +
     '<h3>Inside a cell</h3><ul class="note" style="margin:0 0 14px;padding-left:18px;line-height:1.6;max-width:72ch">' +
     '<li><b>A cycle, not a timer.</b> A cell passes through G1, S, G2 and M, and those phases are wildly unequal: in a 24-hour cycle G1 takes about eleven hours and mitosis barely one. That is why only two or three cells in a hundred are visibly dividing at any moment.</li>' +
     '<li><b>Colchicine makes that visible.</b> It stops a spindle forming, so cells enter mitosis and cannot leave it. They pile up in metaphase with their chromosomes condensed — the only moment a chromosome can be seen at all — and the mitotic index climbs. Every karyotype ever made began this way.</li>' +
@@ -7894,7 +8305,10 @@ function openHelp() {
     '<li><b>Viable count.</b> Ten-fold dilutions, a fixed volume plated, and the plate that falls between 30 and 300 colonies is the one you count. Below thirty the Poisson error swamps the answer; above three hundred the colonies merge. The count is sampled with that error here, so running it twice gives two slightly different answers, as it does on a bench.</li>' +
     '<li><b>Broth microdilution.</b> Twelve wells, doubling down, read after overnight incubation; the MIC is the lowest concentration with no growth. The panel here runs the same pharmacodynamics as the live simulation against the population as it now stands, so a culture that has evolved reports the MIC it has evolved to rather than the one in the table.</li>' +
     '<li><b>Distributions.</b> Histograms of what varies cell to cell. If the growth rate comes out with two peaks rather than one, part of the culture is doing something different from the rest — usually respiring while the other part ferments — and the mean sits in the gap describing nobody.</li>' +
-    '<li><b>Replica plating.</b> Lift the colony pattern off a master plate that has never met the drug, print it onto one that has, and look at where the survivors come up. If the positions are fixed before the drug is applied, the drug did not cause the resistance. This is the 1952 experiment, and it is the cleanest answer to the question there is.</li></ul>' +
+    '<li><b>Replica plating.</b> Lift the colony pattern off a master plate that has never met the drug, print it onto one that has, and look at where the survivors come up. If the positions are fixed before the drug is applied, the drug did not cause the resistance. This is the 1952 experiment, and it is the cleanest answer to the question there is.</li>' +
+    '<li><b>The flow cytometer.</b> Cells pass a laser one at a time and each is measured on its own: forward scatter rises with volume, side scatter with internal structure, and a DNA stain reports how much chromosome the cell is carrying. The cytogram on the Cytometry tab is one point per cell, and the gates across it count the cells below one and a half genome equivalents, between one and a half and three, and above three. That last fraction is the direct test of overlapping replication: feed the culture and it climbs, starve it and it empties. Peaks are broadened by instrument noise, so a real histogram has a coefficient of variation of a few per cent at best, and so does this one.</li>' +
+    '<li><b>The checkerboard.</b> Two drugs crossed against each other in doubling dilutions, every well scored for growth. The edges give you both MICs alone; the staircase between growth and no growth is read as the fractional inhibitory concentration index — the lowest concentration of A that inhibits in company, over the MIC of A alone, plus the same for B. One means nothing was gained: half of each did the work of a whole of either. Below a half is synergy, above four is antagonism. Most pairs come out at one, which is the result worth knowing. Ampicillin with gentamicin does not, because a wall under attack is a leaky envelope and an aminoglycoside gets in faster — the reason that pair is given together for enterococcal endocarditis, which neither cures alone.</li>' +
+    '<li><b>The fluctuation test.</b> Sixteen cultures grown separately from four cells each, then each challenged on its own. If the challenge caused the resistance, every culture had the same chance and the counts would be Poisson — variance equal to mean. What comes out instead is a row of empty bars with one or two towers, and a variance ten or twenty times the mean, because a mutation early in one culture is inherited by everything descended from it. That is the 1943 result, and it also yields a rate without ever seeing a mutation happen: the fraction of cultures with none is e^−m, so m is minus its logarithm, and dividing by the final population gives a rate per cell per division. The cultures here are run in a mutator background, because a field of hundreds of cells cannot host the events a flask of a hundred million would; the shape of the distribution is the result, and the shape does not care about the rate.</li></ul>' +
     '<h3>Ways of making a living</h3><ul class="note" style="margin:0 0 14px;padding-left:18px;line-height:1.6;max-width:72ch">' +
     '<li><b>Not everything eats sugar.</b> <span class="sp-name">Nitrosomonas</span> oxidises ammonia for energy and builds itself out of carbon dioxide, so it grows on a medium with no organic carbon at all and adding sugar does nothing for it. It also acidifies as it goes, and will eventually stop itself.</li>' +
     '<li><b>Not everything breathes oxygen.</b> <span class="sp-name">Desulfovibrio</span> breathes sulfate and exhales hydrogen sulfide, which blocks cytochrome oxidase exactly as cyanide does — so the anaerobe\'s waste kills the aerobe that used up the oxygen for it. <span class="sp-name">Methanobrevibacter</span>, an archaeon, makes methane from carbon dioxide and the hydrogen other organisms release.</li>' +
@@ -7922,7 +8336,7 @@ function openHelp() {
     '<li><b>Enzymes and chelators change the surroundings.</b> DNase does not touch an intact cell: it cuts the extracellular DNA that holds a young biofilm together and destroys the free chromosomes a lysed neighbour left, which ends transformation. N-acetylcysteine breaks the disulfides that stiffen the matrix. Lactoferrin takes the iron away, which stops growth without killing anything.</li>' +
     '<li><b>Warm water is thinner water.</b> Diffusion follows Stokes–Einstein, D ∝ T/η, and the viscosity of water falls by a third between a bench at 20 °C and an incubator at 37 °C. A gradient spreads that much more slowly on the bench, and far more slowly in a fridge.</li></ul>' +
     '<h3>Taking the data away</h3><ul class="note" style="margin:0 0 14px;padding-left:18px;line-height:1.6;max-width:72ch">' +
-    '<li><b>The notebook.</b> Press <kbd>D</kbd>, or the Data button on the readouts. It holds four views: the full time series as a table, what is in the field right now, a tally of every event the run has counted, and the written record. Three buttons copy the time series, the log, or the whole record as text you can paste into a spreadsheet or a report.</li>' +
+    '<li><b>The notebook.</b> Press <kbd>D</kbd>, or the Data button on the readouts. It holds nine views: the full time series as a table, the growth curve with the three numbers a curve is reduced to, histograms of everything that varies cell to cell, the flow cytometer, the two assays — checkerboard and fluctuation test — the population as individual rows, what is in the field right now, a tally of every event the run has counted, and the written record. Three buttons copy the time series, the log, or the whole record as text you can paste into a spreadsheet or a report.</li>' +
     '<li><b>What a sample is.</b> The simulation measures itself at a fixed interval, shown at the foot of the table. Each row is one measurement of the whole field; cumulative counters are recorded alongside, so subtracting two rows gives the rate over that interval. Every export carries a header of the conditions it was taken under, because a number without its conditions is not a result.</li>' +
     '<li><b>Flux and yield.</b> Uptake is reported both per cell, in femtomoles per hour, and per gram of dry biomass, which is how physiologists quote it. Y(X/S) is the dry mass made per gram of substrate eaten: around 0.4 g/g for E. coli breathing oxygen, and much lower when it ferments, which you can watch happen as the oxygen runs out.</li>' +
     '<li><b>Marking the record.</b> The log view has a field for your own notes, stamped with the simulated time. Notes and the whole log travel with a saved culture.</li>' +
@@ -8241,6 +8655,12 @@ function readoutRows() {
     if (dmax > 0) add('Fraction of µmax', (100 * mu / dmax).toFixed(0) + '%', 'µmax ' + (dmax * 60).toFixed(2) + ' h⁻¹ for ' + spLabel(dom0));
     add('Actively growing', (100 * st.growing / Math.max(1, st.bact)).toFixed(0) + '%', st.dormant + ' dormant · ' + st.spores + ' spores');
     add('Mean generations', st.gen.toFixed(1), S.cnt.born.toLocaleString('en-US') + ' divisions so far');
+    // The internal state that sets the growth rate, rather than describing it after the fact.
+    add('Ribosomal proteome', (100 * st.phiR).toFixed(1) + '%', 'supports ' + (ribosomeLimit({ phiR: st.phiR }) * 60).toFixed(2) + ' h⁻¹ · growth law φR = 0.07 + µ/4.2');
+    add('DNA per cell', st.dna.toFixed(2) + ' genome equivalents', st.multifork ? st.multifork + ' cells replicating on multiple forks' : 'one round of replication at a time');
+    if (st.ppgpp > 0.02) add('ppGpp (stringent response)', (100 * st.ppgpp).toFixed(0) + '%', st.ppgpp > 0.5 ? 'ribosome synthesis shut down; survival genes on' : 'supply is starting to lag demand');
+    if (st.sos > 0.02) add('SOS response', (100 * st.sos).toFixed(0) + '%', st.sosOn ? st.sosOn + ' cells filamenting, division blocked by SulA' : 'DNA repair genes induced');
+    if (st.ox > 0.05) add('Oxidative damage', st.ox.toFixed(2), st.ox > 1 ? 'repair is being outrun' : 'within what catalase and SOD can clear');
     add('Biomass', st.dry > 1000 ? (st.dry / 1000).toFixed(2) + ' ng' : st.dry.toFixed(1) + ' pg dry',
       st.vol.toFixed(0) + ' µm³ · ' + (100 * st.vol / (W * H * DEPTH)).toFixed(2) + '% of the field packed');
     add('Mean cell length', st.len.toFixed(2) + ' µm', 'CV ' + (100 * st.lenCV).toFixed(0) + '% across the population');
@@ -8383,6 +8803,13 @@ const DCOLS = [
   { lab: 'lysogens', u: 'count', dp: 0, f: h => h.lysogens },
   { lab: 'intracellular', u: 'count', dp: 0, f: h => h.intra },
   { lab: 'held by post-antibiotic effect', u: 'count', dp: 0, f: h => h.pae },
+  { lab: 'ribosomal proteome', u: 'fraction', dp: 4, f: h => h.phiR },
+  { lab: 'DNA per cell', u: 'genome equivalents', dp: 3, f: h => h.dna },
+  { lab: 'multifork replication', u: 'count', dp: 0, f: h => h.multifork },
+  { lab: 'ppGpp', u: '0-1', dp: 4, f: h => h.ppgpp },
+  { lab: 'SOS response', u: '0-1', dp: 4, f: h => h.sos },
+  { lab: 'filamenting', u: 'count', dp: 0, f: h => h.sosOn },
+  { lab: 'oxidative damage', u: 'arbitrary', dp: 4, f: h => h.ox },
   { lab: 'glucose', u: 'mM', dp: 4, f: h => h.env && h.env.glc },
   { lab: 'oxygen', u: 'µM', dp: 2, f: h => h.env && h.env.o2 * 1000 },
   { lab: 'pH', u: '', dp: 3, f: h => h.env && h.env.pH },
@@ -8516,7 +8943,8 @@ function compRows() {
 // --- single cells: the population as individuals, which is where the distributions live ---
 const CELL_CAP = 4000;
 const CCOLS = ['kind', 'name', 'id', 'x (µm)', 'y (µm)', 'size (µm)', 'volume (µm³)', 'age (min)',
-  'growth rate (1/h)', 'activity (0-1)', 'generation', 'lineage', 'ploidy', 'state', 'genotype', 'notes'];
+  'growth rate (1/h)', 'activity (0-1)', 'generation', 'lineage', 'ploidy', 'state', 'genotype', 'notes',
+  'ribosomal proteome', 'DNA (genome eq)', 'origins', 'ppGpp', 'SOS', 'oxidative damage'];
 function bactState(b) {
   const s = [];
   if (b.dead) s.push('dead');
@@ -8545,7 +8973,8 @@ function cellRows() {
   for (let i = 0; i < n; i++) {
     const b = S.bact[i], d = BACT[b.sp];
     out.push(['bacterium', spLabel(b.sp), b.id, b.x, b.y, b.L, vol(b, d), S.t - b.born,
-      b.mu * 60, b.act, b.gen, b.root, 1, bactState(b), bactGeno(b), b.inf ? VIR[b.inf.v].name : '']);
+      b.mu * 60, b.act, b.gen, b.root, 1, bactState(b), bactGeno(b), b.inf ? VIR[b.inf.v].name : '',
+      b.phiR, b.dna, b.ori, b.ppgpp, b.sos, b.ox]);
   }
   for (const e of S.euk) {
     const st = [];
@@ -8845,6 +9274,73 @@ function distTab() {
     '<p class="micro" style="margin-top:6px">' + n.toLocaleString('en-US') + ' cells. A population is not its mean. Cell length spreads because division is triggered by added size with noise in it; generations are integers, so that histogram is spikes by nature. ' +
     'A growth rate that splits into two peaks is worth stopping at: in a facultative anaerobe it usually means part of the culture is still respiring and part has run out of oxygen and is fermenting, and the ratio between the peaks is the ratio between the two yields. The mean sits between them and describes nobody.</p>';
 }
+// --- the cytometer: every cell measured one at a time, which is the only way to see a subpopulation ---
+let cytoX = 'fsc';
+function cytoTab() {
+  const c = S.cyto;
+  const head = '<div class="dfilt"><button type="button" class="btn primary" data-cyto="run">Acquire 5,000 events</button>' +
+    ['fsc', 'ssc'].map(k => '<button type="button" class="btn' + (cytoX === k ? ' primary' : ' ghost') + '" data-cytox="' + k + '">' +
+      (k === 'fsc' ? 'vs forward scatter' : 'vs side scatter') + '</button>').join('') + '</div>';
+  if (!c) return head + '<p class="insp-empty">No acquisition yet. The cytometer draws a sample from the culture and measures every cell in it individually: size from scattered light, DNA content from a stain.</p>';
+  const s = c.s;
+  const rows = [
+    ['Events acquired', s.n.toLocaleString('en-US'), 'sampled at ' + fmtTime(c.t)],
+    ['Mean DNA content', s.meanDna.toFixed(2) + ' genome eq.', 'one chromosome equivalent = 1.00'],
+    ['Histogram CV', (100 * s.cv).toFixed(1) + '%', 'spread of the DNA distribution'],
+    ['Mean cell volume', s.meanFsc.toFixed(2) + ' µm³', 'forward scatter, calibrated to volume'],
+    ['Under 1.5n', s.pct1.toFixed(1) + '%', 'one chromosome, no replication in progress'],
+    ['1.5n to 3n', s.pct2.toFixed(1) + '%', 'replicating, or two finished chromosomes'],
+    ['Above 3n', s.pct4.toFixed(1) + '%', 'multifork: a second round began before the first ended'],
+  ];
+  return head + '<canvas id="cytoPlot" style="width:100%;height:260px;display:block"></canvas>' +
+    '<dl class="kv ro" style="margin-top:8px">' + rows.map(r =>
+      '<dt>' + esc(r[0]) + '</dt><dd>' + esc(String(r[1])) + '<span class="ro-note">' + esc(r[2]) + '</span></dd>').join('') + '</dl>' +
+    '<p class="micro" style="margin-top:6px">Each point is one cell. The mean DNA content is the test of the Cooper–Helmstetter model: a chromosome takes a fixed time to copy, so a culture doubling faster than that must start the next round before the last one finishes, and its cells carry more than one chromosome each. Slow the culture and the cloud slides down toward 1n; feed it and the fraction above 3n climbs.</p>';
+}
+// --- two assays whose answer is a number, not a picture: synergy, and where mutants come from ---
+let cbA = 'amp', cbB = 'gen', flDrug = 'cip';
+function assayTab() {
+  const dom = dominantSpecies();
+  const avail = ABX2.filter(k => DRUGS[k] && BACT[dom] && BACT[dom].MIC && BACT[dom].MIC[k]);
+  if (!dom || avail.length < 2) return '<p class="insp-empty">These assays need a population with recorded susceptibilities. Inoculate a bacterium first.</p>';
+  if (!avail.includes(cbA)) cbA = avail[0];
+  if (!avail.includes(cbB)) cbB = avail.find(k => k !== cbA) || avail[0];
+  if (!avail.includes(flDrug)) flDrug = avail[0];
+  const pick = (id, cur, lab) => '<div class="field"><label for="' + id + '">' + lab + '</label><span></span>' +
+    '<select id="' + id + '" style="grid-column:1/-1">' + avail.map(k =>
+      '<option value="' + k + '"' + (k === cur ? ' selected' : '') + '>' + esc(DRUGS[k].name) + '</option>').join('') + '</select></div>';
+  const r = S.cbs, f = S.fluct;
+  const cbRows = !r ? [] : [
+    [DRUGS[r.dA].name + ' alone', r.micA == null ? 'off scale' : fmtC(r.micA, DRUGS[r.dA].unit || 'µg/mL'), 'MIC from the bottom row of the board'],
+    [DRUGS[r.dB].name + ' alone', r.micB == null ? 'off scale' : fmtC(r.micB, DRUGS[r.dB].unit || 'µg/mL'), 'MIC from the left column'],
+    ['FIC index', r.fic == null ? '—' : r.fic.toFixed(2), '≤0.5 synergy · 1 additive · >4 antagonism'],
+    ['Verdict', r.verdict, r.at ? 'best well: ' + fmtC(r.at.a, DRUGS[r.dA].unit || '') + ' with ' + fmtC(r.at.b, DRUGS[r.dB].unit || '') : 'no inhibited well on the board'],
+  ];
+  const flRows = !f ? [] : [
+    ['Cultures', f.counts.length + ' grown separately', f.G + ' generations each, about ' + Math.round(f.Nfinal) + ' cells at challenge'],
+    ['Mutants per culture', f.counts.join(', '), 'each culture challenged on its own'],
+    ['Mean', f.mean.toFixed(2), 'what an averaged experiment would have reported'],
+    ['Variance', f.varc.toFixed(2), 'a Poisson process would make this equal the mean'],
+    ['Variance / mean', f.vmr == null ? '—' : f.vmr.toFixed(1), 'far above 1 means the mutants predate the challenge'],
+    ['Cultures with none', f.zeros + ' of ' + f.counts.length, 'the zero fraction is what the rate is estimated from'],
+    ['Mutation rate', f.rate == null ? 'not estimable' : fmtSci(f.rate) + ' per cell per generation', 'estimated from P₀ = e^−m'],
+    ['Rate actually set', fmtSci(f.trueRate) + ' per cell per generation', 'a mutator background ' + fmtSci(f.amp) + '× the wild type, so that a field of hundreds of cells holds the events a flask of 10⁸ would'],
+    ['Verdict', f.verdict, 'Luria and Delbrück, 1943'],
+  ];
+  const kv = rows => '<dl class="kv ro" style="margin-top:8px">' + rows.map(x =>
+    '<dt>' + esc(x[0]) + '</dt><dd>' + esc(String(x[1])) + '<span class="ro-note">' + esc(x[2]) + '</span></dd>').join('') + '</dl>';
+  return '<div class="box"><div class="box-h"><span class="micro">Checkerboard synergy — ' + esc(spLabel(dom)) + '</span></div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' + pick('cbA', cbA, 'Across') + pick('cbB', cbB, 'Down') + '</div>' +
+    '<div class="dfilt"><button type="button" class="btn primary" data-assay="cb">Run the checkerboard</button></div>' +
+    '<canvas id="cbPlot" style="width:100%;height:230px;display:block"></canvas>' + (r ? kv(cbRows) : '') +
+    '<p class="micro" style="margin-top:6px">A shaded well grew. The index asks whether the staircase between growth and no growth bows in toward the origin: if half the MIC of each drug inhibits, the two are merely additive and the index is one. Most pairs come out at one, which is the result worth knowing. Ampicillin with gentamicin does not: a wall under attack is a leaky envelope and the aminoglycoside gets in faster, which is why that pair is given together for enterococcal endocarditis, an infection neither drug cures alone.</p></div>' +
+    '<div class="box" style="margin-top:10px"><div class="box-h"><span class="micro">Fluctuation test</span></div>' +
+    pick('flD', flDrug, 'Challenge with') +
+    '<div class="dfilt"><button type="button" class="btn primary" data-assay="fl">Run 16 parallel cultures</button>' +
+    '<span class="hint">Grows sixteen cultures through eight generations each, so it takes a few tens of seconds. The field is borrowed for the duration and handed back exactly as it was.</span></div>' +
+    '<canvas id="flPlot" style="width:100%;height:200px;display:block"></canvas>' + (f ? kv(flRows) : '') +
+    '<p class="micro" style="margin-top:6px">Sixteen cultures from four cells each, grown apart, then each challenged on its own. If the drug caused the resistance every culture would have had the same chance and the counts would be Poisson — variance equal to mean. A few towers among empty bars mean the mutations happened during the growth beforehand, and the early ones were inherited by everything descended from them.</p></div>';
+}
 function compTable() {
   const rows = compRows();
   if (!rows.length) return '<p class="insp-empty">Nothing in the field yet.</p>';
@@ -8875,10 +9371,11 @@ function logTable() {
 }
 function openData(tab) {
   dataTab = tab || dataTab;
-  const tabs = [['series', 'Time series'], ['curve', 'Growth curve'], ['dist', 'Distributions'], ['cells', 'Single cells'],
-    ['comp', 'Composition'], ['events', 'Event tally'], ['log', 'Event log']];
+  const tabs = [['series', 'Time series'], ['curve', 'Growth curve'], ['dist', 'Distributions'], ['cyto', 'Cytometry'],
+    ['assay', 'Assays'], ['cells', 'Single cells'], ['comp', 'Composition'], ['events', 'Event tally'], ['log', 'Event log']];
   const body = dataTab === 'series' ? seriesTable() : dataTab === 'curve' ? curveTab() : dataTab === 'dist' ? distTab() :
-    dataTab === 'cells' ? cellTable() : dataTab === 'comp' ? compTable() : dataTab === 'events' ? tallyTable() : logTable();
+    dataTab === 'cyto' ? cytoTab() : dataTab === 'assay' ? assayTab() : dataTab === 'cells' ? cellTable() :
+    dataTab === 'comp' ? compTable() : dataTab === 'events' ? tallyTable() : logTable();
   openModal('<div class="dlg-head"><div><span class="micro">' + esc(S.scenario ? S.scenario.title : 'Sandbox') +
     ' · replicate ' + (S.repN || 1) + ' · seed ' + (S.seedUsed || 0) + ' · ' + fmtTime(S.t) + ' sim time</span>' +
     '<h2 id="dlgTitle">Data <em>notebook</em></h2></div><button type="button" class="btn" data-close>Close</button></div>' +
@@ -8894,6 +9391,20 @@ function openData(tab) {
   // Canvases can only be drawn once they are in the document and have a width.
   if (dataTab === 'curve') drawGrowthCurve($('odCurve'));
   if (dataTab === 'dist') DISTS.forEach(s => drawHist($('h_' + s.key), s));
+  if (dataTab === 'cyto') drawCytogram($('cytoPlot'), cytoX, 'dna');
+  if (dataTab === 'assay') {
+    drawCheckerboard($('cbPlot')); drawFluctuation($('flPlot'));
+    const sa = $('cbA'), sb = $('cbB'), sf = $('flD');
+    if (sa) sa.addEventListener('change', () => { cbA = sa.value; });
+    if (sb) sb.addEventListener('change', () => { cbB = sb.value; });
+    if (sf) sf.addEventListener('change', () => { flDrug = sf.value; });
+    dialog.querySelectorAll('[data-assay]').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.assay === 'cb') runCheckerboard(cbA, cbB); else fluctuationTest(flDrug, 8);
+      openData('assay');
+    }));
+  }
+  dialog.querySelectorAll('[data-cyto]').forEach(b => b.addEventListener('click', () => { runCytometry(); openData('cyto'); }));
+  dialog.querySelectorAll('[data-cytox]').forEach(b => b.addEventListener('click', () => { cytoX = b.dataset.cytox; openData('cyto'); }));
   dialog.querySelectorAll('[data-mic]').forEach(b => b.addEventListener('click', () => { runMicPanel(b.dataset.mic); openData('curve'); }));
   dialog.querySelectorAll('[data-filt]').forEach(b => b.addEventListener('click', () => { dataFilter = b.dataset.filt; openData('log'); }));
   const nb = dialog.querySelector('[data-note]');
@@ -9296,7 +9807,12 @@ function histOf(values, bins) {
 const DISTS = [
   { key: 'len', lab: 'Cell length', unit: 'µm', get: b => b.L },
   { key: 'mu', lab: 'Growth rate', unit: 'h⁻¹', get: b => b.mu * 60 },
+  { key: 'dna', lab: 'DNA content', unit: 'genome equivalents', get: b => b.dna },
+  { key: 'phiR', lab: 'Ribosomal proteome', unit: 'fraction', get: b => b.phiR },
   { key: 'act', lab: 'Activity', unit: '0–1', get: b => b.act },
+  { key: 'ppgpp', lab: 'ppGpp', unit: '0–1', get: b => b.ppgpp },
+  { key: 'sos', lab: 'SOS response', unit: '0–1', get: b => b.sos },
+  { key: 'ox', lab: 'Oxidative damage', unit: 'arbitrary', get: b => b.ox },
   { key: 'gen', lab: 'Generations', unit: 'since start', get: b => b.gen },
   { key: 'age', lab: 'Time since division', unit: 'min', get: b => S.t - b.born },
   { key: 'vol', lab: 'Cell volume', unit: 'µm³', get: b => vol(b, BACT[b.sp]) },
@@ -9344,6 +9860,335 @@ function runMicPanel(drug) {
     (r.mic == null ? '> ' + fmtC(r.wells[r.wells.length - 1].c, DRUGS[drug].unit || 'µg/mL') : fmtC(r.mic, DRUGS[drug].unit || 'µg/mL')) +
     (fold > 1.9 ? ', ' + fold.toFixed(0) + '× the wild type' : '') + ' (' + r.n + ' cells in the inoculum).', fold > 1.9 ? 'evo' : 'note');
   return r;
+}
+// ===== SECTION: THE CHECKERBOARD =====
+// Two drugs crossed against each other, doubling dilutions along each axis, and every well scored
+// for growth. The point of it is a number: the fractional inhibitory concentration index, which
+// asks whether a combination does better than the sum of its parts. Take the lowest concentration
+// of A that still inhibits when B is present, divide by the MIC of A alone, do the same for B, and
+// add the two. One means the drugs are simply additive — half of each does the work of a whole of
+// either. Below a half is synergy and the combination is worth giving; above four is antagonism and
+// it is worse than either drug alone. Trimethoprim and sulfamethoxazole are the classic synergistic
+// pair, because they block two consecutive steps of the same pathway.
+const CB_STEPS = 8;
+function checkerboard(dA, dB, sp) {
+  const d = BACT[sp];
+  if (!d || !DRUGS[dA] || !DRUGS[dB] || dA === dB) return null;
+  const cells = S.bact.filter(b => !b.dead && b.sp === sp);
+  if (!cells.length) return null;
+  const psiRef = d.mumax * 60;
+  const axis = (k) => {
+    const top = (d.MIC[k] || 1) * 4, out = [0];
+    for (let i = CB_STEPS - 2; i >= 0; i--) out.push(top / Math.pow(2, i));
+    return out;                                // first well is drug-free, then rising
+  };
+  const ca = axis(dA), cb = axis(dB);
+  // The net growth rate under a total relative dose U, where one unit is the MIC. The Hill form is
+  // the same one the live simulation uses, and it is built so that U = 1 gives exactly zero net
+  // growth — which is what an MIC is.
+  const hill = (U, pmin, kap) => {
+    if (U <= 0) return psiRef;
+    const r = Math.pow(U, kap), R = -pmin / psiRef;
+    return psiRef - (psiRef - pmin) * r / (r + R);
+  };
+  // Net growth rate under both drugs at once. Each drug is counted in units of its own MIC and the
+  // units are added — concentration addition, which is the null model the FIC index is defined
+  // against: half an MIC of each makes one MIC between them and the index comes out at exactly one.
+  // A combination that does better than that has done something, and one that does worse has too.
+  // What makes a pair interact here is mechanism rather than a fitted interaction term: a drug that
+  // kills by making the cell build a faulty wall needs a cell that is building one, so its dose
+  // counts for less in proportion to how much growth the other drug has already taken away. That is
+  // the antagonism Jawetz measured between penicillin and a ribosome inhibitor in 1951, and it
+  // falls out of the mechanism instead of being put in by hand.
+  const netAt = (b, a, bb) => {
+    const pairs = [[dA, a], [dB, bb]].filter(p => p[1] > 0);
+    if (!pairs.length) return psiRef;
+    let U = 0, wmin = 0, wk = 0;
+    const add = (k, c, scale) => {
+      const dr = DRUGS[k], u = (c / micOf(b, k)) * scale;
+      if (!(u > 0)) return;
+      U += u; wmin += u * dr.psiMin; wk += u * dr.kappa;
+    };
+    // A wall under attack is a leaky envelope, so a drug that has to be carried across it gets in
+    // faster. This is the same term the live simulation uses, and it is the one drug-drug
+    // interaction either of them contains: it is what makes a β-lactam and an aminoglycoside worth
+    // giving together. Nothing discounts a wall-active drug for being combined with one that slows
+    // the cell, because the simulation does not either — there, a β-lactam's potency follows the
+    // cell's own metabolic activity, which in a fresh broth well is as high as it goes.
+    let wall = 0;
+    for (const [k, c] of pairs) if (WALL_DRUGS.indexOf(k) >= 0) { const r = c / micOf(b, k); wall += r / (r + 1); }
+    wall = Math.min(1, wall);
+    for (const [k, c] of pairs) {
+      if (DRUGS[k].needs === 'anaerobic' && !(d.anaer > 0.5)) continue;   // nothing here reduces it
+      add(k, c, DRUGS[k].needs === 'pmf' ? 1 + WALL_UPTAKE * wall : 1);
+    }
+    return hill(U, U > 0 ? wmin / U : 0, U > 0 ? wk / U : 1);
+  };
+  const grid = [];
+  for (let j = 0; j < cb.length; j++) {
+    const row = [];
+    for (let i = 0; i < ca.length; i++) {
+      let grew = 0;
+      for (const b of cells) if (netAt(b, ca[i], cb[j]) > 0.02 * psiRef) grew++;
+      row.push({ a: ca[i], b: cb[j], frac: grew / cells.length, growth: grew / cells.length > 0.01 });
+    }
+    grid.push(row);
+  }
+  // The MIC of each drug on its own is the edge of the board: row 0 and column 0.
+  const edgeMic = (arr) => { for (const w of arr) if (!w.growth) return w.a || w.b; return null; };
+  const micA = edgeMic(grid[0]), micB = edgeMic(grid.map(r => r[0]));
+  // Every inhibited well that contains both drugs gives an index, and the combination is judged by
+  // the lowest. Wells on the two edges are excluded on purpose: a well holding one drug at its own
+  // MIC scores exactly one by construction and would hide whatever the pair is really doing.
+  let best = null;
+  if (micA && micB) for (let j = 1; j < cb.length; j++) for (let i = 1; i < ca.length; i++) {
+    const w = grid[j][i];
+    if (w.growth) continue;
+    const idx = w.a / micA + w.b / micB;
+    if (best == null || idx < best.idx) best = { idx, a: w.a, b: w.b };
+  }
+  // The conventional bands: half or less is worth calling synergy, four or more is antagonism, and
+  // the wide middle means the two drugs are simply getting on with their own business.
+  const verdict = !best ? 'no combination inhibited' : best.idx <= 0.5 ? 'synergy'
+    : best.idx < 0.9 ? 'rather better than additive' : best.idx <= 1.15 ? 'additive — nothing gained by combining'
+    : best.idx < 4 ? 'indifferent, and the combination costs more than it returns' : 'antagonism';
+  return { dA, dB, sp, ca, cb, grid, micA, micB, fic: best ? best.idx : null, at: best, verdict, n: cells.length };
+}
+function runCheckerboard(dA, dB) {
+  const sp = dominantSpecies();
+  const r = checkerboard(dA, dB, sp);
+  if (!r) { toast('No population to test, or two different drugs are needed.', 3000); return null; }
+  S.cbs = r;
+  const uA = DRUGS[dA].unit || 'µg/mL', uB = DRUGS[dB].unit || 'µg/mL';
+  addLog('Checkerboard, ' + DRUGS[dA].name + ' against ' + DRUGS[dB].name + ' on ' + spLabel(sp) + ': MICs alone ' +
+    (r.micA == null ? 'off scale' : fmtC(r.micA, uA)) + ' and ' + (r.micB == null ? 'off scale' : fmtC(r.micB, uB)) +
+    (r.fic == null ? '' : '; the best combination inhibits at ' + fmtC(r.at.a, uA) + ' with ' + fmtC(r.at.b, uB) +
+      ', an FIC index of ' + r.fic.toFixed(2)) + ' — ' + r.verdict + '.', r.fic != null && r.fic <= 0.5 ? 'good' : 'note');
+  once('fic', 'An FIC index of one means nothing has been gained: half the MIC of each does exactly what a full MIC of either would. Only a number clearly below one says the two drugs are helping each other, and the convention is to call it synergy below a half.', '');
+  return r;
+}
+// ===== SECTION: THE FLUCTUATION TEST =====
+// Luria and Delbrück, 1943, and one of the few experiments that settled a question outright. Grow
+// many small cultures separately, then challenge each one, and count the survivors. If resistance
+// arose because the challenge induced it, every culture had the same chance and the counts would
+// follow a Poisson distribution, whose variance equals its mean. If instead mutations happen at
+// random during the growth that came before, then a mutation early in one culture is inherited by
+// all its descendants, and that culture yields a jackpot of hundreds where its neighbours yield
+// none. The variance then vastly exceeds the mean. That is what they found, and it is why the
+// counts below are worth looking at one culture at a time rather than as an average.
+const FLUCT_CULTURES = 16;
+// Luria and Delbrück had 10⁸ cells in each culture and a mutation rate near 10⁻⁹, which put a
+// handful of events in each one. This field holds a few hundred cells, so the rate is raised by
+// about six orders of magnitude to put a comparable handful in each culture — a mutator background,
+// which is a real thing to be in. The shape of the distribution is what the experiment is about,
+// and the shape does not care about the absolute rate. The rate the test then recovers from the
+// zero fraction can be checked against the one it was given, which is a test of the estimator.
+const FLUCT_AMP = 1e6;
+function fluctuationTest(drug, gens) {
+  const sp = dominantSpecies();
+  if (!sp) { toast('Nothing growing to test.', 2600); return null; }
+  const d = BACT[sp];
+  if (!d.MIC || !d.MIC[drug]) { toast('No susceptibility recorded for that drug.', 2800); return null; }
+  const G = clamp(gens || 7, 4, 9);
+  // The whole field is borrowed for the duration and handed back exactly as it was.
+  const keep = snapshot();
+  const cultures = [];
+  const dose = (d.MIC[drug] || 1) * 8;
+  const base = (S.seedUsed || 12345) + Math.floor(S.t);
+  for (let k = 0; k < FLUCT_CULTURES; k++) {
+    startScenario('sandbox');
+    // Starting a scenario reseeds the generator, which would make all sixteen cultures the same
+    // culture — and the entire point of the experiment is that they are independent. Each gets its
+    // own stream, which is the computational equivalent of sixteen separate tubes.
+    seed(base + 7919 * (k + 1));
+    S.bact.length = 0; S.euk.length = 0; S.phago.length = 0; S.cells.length = 0;
+    S.env.T = d.T[1]; S.env.o2Mode = 'kla'; S.env.kla = 120; S.env.rich = 1;
+    S.env.mutAmp = FLUCT_AMP;
+    for (let i = 0; i < 4; i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1, phiR: 0.45 });
+    let el = 0;
+    const target = 4 * Math.pow(2, G);
+    while (S.bact.filter(b => !b.dead).length < target && el < 60 * G) { feedCarbon(6); fastForward(5); el += 5; }
+    const live = S.bact.filter(b => !b.dead);
+    // Challenge: every cell that can still grow at eight times the wild-type MIC is a mutant.
+    let res = 0;
+    for (const b of live) if (micOf(b, drug) > dose * 0.9) res++;
+    cultures.push({ n: live.length, res, mins: el });
+  }
+  restore(JSON.parse(JSON.stringify(keep)));
+  const counts = cultures.map(c => c.res);
+  const n = counts.length;
+  const mean = counts.reduce((a, b) => a + b, 0) / n;
+  let q = 0; for (const c of counts) q += (c - mean) * (c - mean);
+  const varc = n > 1 ? q / (n - 1) : 0;
+  const zeros = counts.filter(c => c === 0).length;
+  const Nfinal = cultures.reduce((a, c) => a + c.n, 0) / n;
+  // The P0 method: if the number of mutational events per culture is Poisson with mean m, the
+  // chance of a culture having none is e^-m, so m is minus the log of the zero fraction. Dividing
+  // by the final population gives a rate per cell per division.
+  const p0 = zeros / n;
+  const m = p0 > 0 && p0 < 1 ? -Math.log(p0) : null;
+  const rate = m != null ? m / Nfinal : null;
+  // Both daughters are tested for a new mutation at each division, so the rate per division is
+  // twice the per-cell probability. This is the number the estimate above should land on.
+  const trueRate = 2 * (MUT_BASE[drug] || 1e-9) * FLUCT_AMP;
+  const r = { drug, sp, cultures, counts, mean, varc, vmr: mean > 0 ? varc / mean : null, zeros, p0, m, rate, Nfinal, G,
+    amp: FLUCT_AMP, trueRate,
+    verdict: mean > 0 && varc / mean > 3 ? 'random mutation during growth' : mean === 0 ? 'no mutants recovered' : 'indistinguishable from Poisson' };
+  S.fluct = r;
+  addLog('Fluctuation test, ' + DRUGS[drug].name + ' against ' + spLabel(sp) + ': ' + n + ' cultures grown separately for ' +
+    G + ' generations, then challenged. Mutants per culture ' + counts.join(', ') + '. Mean ' + mean.toFixed(2) +
+    ', variance ' + varc.toFixed(2) + ', ratio ' + (mean > 0 ? (varc / mean).toFixed(1) : '—') + '. ' + zeros + ' of ' + n +
+    ' cultures had none' + (rate ? ', giving a mutation rate of ' + fmtSci(rate) + ' per cell per generation' : '') + '.',
+    mean > 0 && varc / mean > 3 ? 'evo' : 'note');
+  once('fluct', 'A Poisson distribution has its variance equal to its mean. If the ratio comes out far above one, the mutants cannot have been made by the challenge — they were already there, inherited from an ancestor that mutated while the culture was still growing. That is the whole of the Luria–Delbrück argument, and the jackpot cultures are where it shows.', '');
+  return r;
+}
+// ===== SECTION: FLOW CYTOMETRY =====
+// Cells pass a laser one at a time. Forward scatter rises with size, side scatter with internal
+// structure, and a DNA stain reports how much chromosome each cell is carrying. On a bacterial
+// culture the DNA histogram is the direct test of the Cooper–Helmstetter model: a slowly growing
+// population sits between one and two genome equivalents, and a fast one sits between two and four,
+// because its cells never finish one round of replication before starting the next.
+function cytometryEvents(maxN) {
+  const live = S.bact.filter(b => !b.dead);
+  const n = Math.min(live.length, maxN || 5000);
+  const step = live.length > n ? live.length / n : 1;
+  const ev = [];
+  for (let k = 0; k < n; k++) {
+    const b = live[Math.floor(k * step)];
+    if (!b) continue;
+    const d = BACT[b.sp];
+    const V = vol(b, d);
+    // Every measurement a cytometer makes carries instrument noise, and a real DNA histogram is
+    // broadened by it: the peaks have a coefficient of variation of a few per cent at best.
+    ev.push({
+      fsc: Math.max(0.01, V * (1 + 0.06 * gauss())),
+      ssc: Math.max(0.01, V * (0.3 + 0.7 * (b.bio ? 1.6 : 1) + 0.08 * gauss())),
+      dna: Math.max(0.05, (b.dna || 1) * (1 + 0.045 * gauss())),
+      live: !(b.dormant || b.spore === 2),
+      sp: b.sp,
+    });
+  }
+  return ev;
+}
+function cytometrySummary(ev) {
+  if (!ev.length) return null;
+  let d1 = 0, d2 = 0, d4 = 0, fsc = 0, dna = 0;
+  for (const e of ev) {
+    fsc += e.fsc; dna += e.dna;
+    if (e.dna < 1.5) d1++; else if (e.dna < 3) d2++; else d4++;
+  }
+  const n = ev.length;
+  let q = 0; const m = dna / n;
+  for (const e of ev) q += (e.dna - m) * (e.dna - m);
+  return { n, meanFsc: fsc / n, meanDna: m, cv: m > 0 ? Math.sqrt(q / n) / m : 0,
+    pct1: 100 * d1 / n, pct2: 100 * d2 / n, pct4: 100 * d4 / n };
+}
+function runCytometry() {
+  const ev = cytometryEvents(5000);
+  const s = cytometrySummary(ev);
+  if (!s) { toast('No cells to run.', 2400); return null; }
+  S.cyto = { t: S.t, ev, s };
+  addLog('Flow cytometry: ' + s.n.toLocaleString('en-US') + ' events, mean DNA ' + s.meanDna.toFixed(2) +
+    ' genome equivalents (CV ' + (100 * s.cv).toFixed(0) + '%) — ' + s.pct1.toFixed(0) + '% under 1.5n, ' +
+    s.pct2.toFixed(0) + '% between 1.5 and 3n, ' + s.pct4.toFixed(0) + '% above 3n.', 'note');
+  once('cyto', 'A DNA histogram is how the Cooper–Helmstetter model is tested. If a population doubling faster than it can replicate its chromosome really does start the next round early, its cells must carry more than one chromosome equivalent each — and they do. Slow the culture down and the distribution slides back toward one.', '');
+  return S.cyto;
+}
+// A dot plot: one point per cell, which is how a cytogram is read. Density matters more than any
+// single point, so overlapping events are drawn faintly and build up where cells cluster.
+function drawCytogram(cv, xKey, yKey) {
+  const c = S.cyto;
+  instrChart(cv, (x, w, h, col) => {
+    const pad = { l: 46, r: 10, t: 10, b: 26 };
+    const muted = col('--muted'), line = col('--line'), accent = col('--accent');
+    x.strokeStyle = line; x.lineWidth = 1; x.strokeRect(pad.l, pad.t, w - pad.l - pad.r, h - pad.t - pad.b);
+    if (!c || !c.ev.length) { x.fillStyle = muted; x.font = '12px ' + col('--f-ui'); x.fillText('Run the cytometer to collect events.', pad.l + 10, h / 2); return; }
+    let xmax = 0, ymax = 0;
+    for (const e of c.ev) { if (e[xKey] > xmax) xmax = e[xKey]; if (e[yKey] > ymax) ymax = e[yKey]; }
+    xmax *= 1.1; ymax *= 1.1;
+    const X = v => pad.l + v / xmax * (w - pad.l - pad.r);
+    const Y = v => h - pad.b - v / ymax * (h - pad.t - pad.b);
+    x.fillStyle = rgba(accent, 0.22);
+    for (const e of c.ev) { x.beginPath(); x.arc(X(e[xKey]), Y(e[yKey]), 1.1, 0, TAU); x.fill(); }
+    x.fillStyle = muted; x.font = '10px ' + col('--f-mono');
+    x.textAlign = 'center';
+    x.fillText('0', pad.l, h - 9); x.fillText(xmax.toFixed(1), w - pad.r, h - 9);
+    x.textAlign = 'right'; x.fillText(ymax.toFixed(1), pad.l - 5, pad.t + 9);
+    x.save(); x.translate(12, h / 2); x.rotate(-Math.PI / 2); x.textAlign = 'center';
+    x.font = '11px ' + col('--f-ui'); x.fillText(yKey === 'dna' ? 'DNA (genome eq)' : yKey.toUpperCase(), 0, 0); x.restore();
+    x.textAlign = 'center'; x.font = '11px ' + col('--f-ui');
+    x.fillText(xKey === 'fsc' ? 'Forward scatter (cell volume, µm³)' : xKey.toUpperCase(), (w + pad.l) / 2, h - 1);
+    // The gates that matter on a bacterial DNA histogram: one chromosome, two, and more than two.
+    x.strokeStyle = rgba(muted, 0.5); x.setLineDash([3, 3]); x.lineWidth = 0.8;
+    if (yKey === 'dna') for (const g of [1.5, 3]) { if (g < ymax) { x.beginPath(); x.moveTo(pad.l, Y(g)); x.lineTo(w - pad.r, Y(g)); x.stroke(); } }
+    x.setLineDash([]);
+  });
+}
+// The board itself: concentration of one drug across, the other down, and a well shaded by whether
+// anything in it can still grow. The staircase where shading meets clear is the isobologram, and
+// how far it bows toward the origin is the synergy.
+function drawCheckerboard(cv) {
+  const r = S.cbs;
+  instrChart(cv, (x, w, h, col) => {
+    const pad = { l: 58, r: 10, t: 14, b: 34 };
+    const muted = col('--muted'), line = col('--line'), accent = col('--accent');
+    if (!r) { x.fillStyle = muted; x.font = '12px ' + col('--f-ui'); x.fillText('Run a checkerboard to fill the board.', pad.l, h / 2); return; }
+    const cols = r.ca.length, rows = r.cb.length;
+    const cw = (w - pad.l - pad.r) / cols, chh = (h - pad.t - pad.b) / rows;
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const wl = r.grid[j][i];
+      // Bottom row is the drug-free control, so the board reads with concentration rising upward.
+      const px = pad.l + i * cw, py = pad.t + (rows - 1 - j) * chh;
+      x.fillStyle = wl.growth ? rgba(accent, 0.18 + 0.5 * wl.frac) : 'transparent';
+      if (wl.growth) x.fillRect(px, py, cw - 1, chh - 1);
+      x.strokeStyle = rgba(line, 0.8); x.lineWidth = 0.6; x.strokeRect(px, py, cw - 1, chh - 1);
+      if (r.at && Math.abs(wl.a - r.at.a) < 1e-9 && Math.abs(wl.b - r.at.b) < 1e-9) {
+        x.strokeStyle = col('--good'); x.lineWidth = 2; x.strokeRect(px + 1, py + 1, cw - 3, chh - 3);
+      }
+    }
+    x.fillStyle = muted; x.font = '10px ' + col('--f-mono'); x.textAlign = 'center';
+    x.fillText('0', pad.l + cw / 2, h - pad.b + 13);
+    x.fillText(fmtC(r.ca[r.ca.length - 1], ''), pad.l + (cols - 0.5) * cw, h - pad.b + 13);
+    x.textAlign = 'right';
+    x.fillText('0', pad.l - 5, pad.t + (rows - 0.5) * chh + 3);
+    x.fillText(fmtC(r.cb[r.cb.length - 1], ''), pad.l - 5, pad.t + 0.5 * chh + 3);
+    x.textAlign = 'center'; x.font = '11px ' + col('--f-ui');
+    x.fillText(DRUGS[r.dA].name + ' (' + (DRUGS[r.dA].unit || 'µg/mL') + ')', (w + pad.l) / 2, h - 4);
+    x.save(); x.translate(13, h / 2); x.rotate(-Math.PI / 2); x.textAlign = 'center';
+    x.fillText(DRUGS[r.dB].name, 0, 0); x.restore();
+  });
+}
+// Sixteen cultures, each a bar. The shape is the result: a row of empties with one or two towers is
+// random mutation; sixteen bars of much the same height would have meant the challenge caused it.
+function drawFluctuation(cv) {
+  const r = S.fluct;
+  instrChart(cv, (x, w, h, col) => {
+    const pad = { l: 40, r: 10, t: 14, b: 30 };
+    const muted = col('--muted'), line = col('--line');
+    if (!r) { x.fillStyle = muted; x.font = '12px ' + col('--f-ui'); x.fillText('Run a fluctuation test to fill this.', pad.l, h / 2); return; }
+    const n = r.counts.length, bw = (w - pad.l - pad.r) / n;
+    const top = Math.max(1, Math.max.apply(null, r.counts)) * 1.15;
+    x.strokeStyle = line; x.lineWidth = 1;
+    x.beginPath(); x.moveTo(pad.l, h - pad.b); x.lineTo(w - pad.r, h - pad.b); x.stroke();
+    for (let i = 0; i < n; i++) {
+      const c = r.counts[i], bh = (h - pad.t - pad.b) * c / top;
+      x.fillStyle = c === 0 ? rgba(muted, 0.25) : c > r.mean * 3 ? col('--warn') : col('--accent');
+      x.fillRect(pad.l + i * bw + 1, h - pad.b - bh, bw - 2, bh);
+    }
+    // Where the mean sits, so the jackpots can be seen for what they are.
+    const my = h - pad.b - (h - pad.t - pad.b) * r.mean / top;
+    x.strokeStyle = rgba(col('--bad'), 0.8); x.setLineDash([4, 3]); x.lineWidth = 1;
+    x.beginPath(); x.moveTo(pad.l, my); x.lineTo(w - pad.r, my); x.stroke(); x.setLineDash([]);
+    x.fillStyle = muted; x.font = '10px ' + col('--f-mono'); x.textAlign = 'right';
+    x.fillText(Math.round(top).toString(), pad.l - 5, pad.t + 9);
+    x.fillText('0', pad.l - 5, h - pad.b + 3);
+    // The mean belongs on its own line rather than in the axis gutter, where it would be clipped.
+    x.textAlign = 'left';
+    x.fillText('mean ' + r.mean.toFixed(1), pad.l + 4, Math.max(pad.t + 9, my - 4));
+    x.textAlign = 'center'; x.font = '11px ' + col('--f-ui');
+    x.fillText('one bar per culture, grown and challenged separately', (w + pad.l) / 2, h - 4);
+  });
 }
 // --- the viable count, done the way it is actually done ---
 // You cannot count 10⁹ cells. You dilute tenfold repeatedly, plate a fixed volume of each, and
@@ -9733,7 +10578,9 @@ function snapshot() {
     bact: S.bact.map(b => [SP_IDX.indexOf(b.sp), r3(b.x), r3(b.y), r3(b.a), r3(b.L), r3(b.Lb), r3(b.Ldiv), b.gen, r3(b.act),
       r3(b.lag), r3(b.starve), (b.dormant ? 1 : 0) | (b.bio ? 2 : 0) | (b.qs ? 4 : 0) | (b.lys ? 8 : 0) | (b.stuck ? 16 : 0),
       b.spore, b.rec, b.pl, b.cas || 0, b.root, b.g, b.inf ? [VIRI.indexOf(b.inf.v), r3(b.inf.t0), b.inf.moi, b.inf.lytic ? 1 : 0, b.inf.decided ? 1 : 0, r3(b.inf.latent || 0), b.inf.burst || 0] : 0,
-      b.host ? (cellIdx.has(b.host) ? cellIdx.get(b.host) : -1) : -1, VIRI.indexOf(b.lysV || 'lam'), r3(b.born), r3(b.pae || 0)]),
+      b.host ? (cellIdx.has(b.host) ? cellIdx.get(b.host) : -1) : -1, VIRI.indexOf(b.lysV || 'lam'), r3(b.born), r3(b.pae || 0),
+      // Internal physiology: ribosome content, alarmone, damage, SOS, and where replication has got to.
+      r3(b.phiR), r3(b.ppgpp), r3(b.ox), r3(b.sos), b.ori, b.chr, (b.rounds || []).map(r => [r.n, r3(r.p)]), r3(b.dna)]),
     euk: S.euk.map(e => ({ k: e.kind, x: r3(e.x), y: r3(e.y), a: r3(e.a), r: r3(e.r), g: e.gen, V: e.V, bud: e.bud, age: e.age,
       life: e.life, sen: e.senesce, food: e.food, cyst: e.cyst, lastEat: e.lastEat, lastDiv: e.lastDiv, form: e.form,
       spore: e.spore, germT: e.germT, len: e.len, born: e.born, seed: e.seed,
@@ -9778,12 +10625,19 @@ function restore(s) {
   });
   // Packed layout: 0 sp, 1 x, 2 y, 3 angle, 4 L, 5 Lb, 6 Ldiv, 7 gen, 8 act, 9 lag, 10 starve,
   // 11 state bits, 12 spore, 13 rec, 14 plasmid, 15 cas, 16 root, 17 genotype, 18 infection,
-  // 19 host cell index, 20 prophage, 21 born, 22 post-antibiotic effect left.
+  // 19 host cell index, 20 prophage, 21 born, 22 post-antibiotic effect left,
+  // 23 phiR, 24 ppGpp, 25 oxidative damage, 26 SOS, 27 origins, 28 chromosomes, 29 replication rounds, 30 DNA.
   S.bact = (s.bact || []).map(a => {
     const b = makeBact(SP_IDX[a[0]], a[1], a[2], { a: a[3], gen: a[7], g: a[17], rec: a[13], pl: a[14], cas: a[15], root: a[16] });
     b.L = a[4]; b.Lb = a[5]; b.Ldiv = a[6]; b.act = a[8]; b.lag = a[9]; b.starve = a[10];
     b.dormant = !!(a[11] & 1); b.bio = !!(a[11] & 2); b.qs = !!(a[11] & 4); b.lys = !!(a[11] & 8); b.stuck = !!(a[11] & 16);
     b.spore = a[12]; b.born = a[21]; b.lysV = VIRI[a[20]] || 'lam'; b.pae = a[22] || 0; b.cost = costOf(b);
+    // Saves written before the physiology model keep their defaults from makeBact.
+    if (a.length > 23) {
+      b.phiR = a[23]; b.ppgpp = a[24]; b.ox = a[25]; b.sos = a[26];
+      b.ori = a[27] || 1; b.chr = a[28] || 1; b.dna = a[30] || 1;
+      b.rounds = (a[29] || []).map(r => ({ n: r[0], p: r[1] }));
+    }
     if (a[18]) b.inf = { v: VIRI[a[18][0]], t0: a[18][1], moi: a[18][2], lytic: !!a[18][3], decided: !!a[18][4], latent: a[18][5], burst: a[18][6] };
     if (a[19] >= 0 && S.cells[a[19]]) b.host = S.cells[a[19]];
     return b;
@@ -10194,7 +11048,7 @@ function start(data) {
   wireOptics();
   setIllum(ILLUMS.includes(savedIllum) ? savedIllum : 'auto');
   const q = new URLSearchParams(location.search);
-  const headlessRun = q.get('autotest') || q.get('t') || q.get('probe') || q.get('datacheck') || q.get('toolcheck') || q.get('biocheck') || q.get('cellcheck');   // test runs stay paused so the page settles
+  const headlessRun = q.get('autotest') || q.get('t') || q.get('probe') || q.get('datacheck') || q.get('toolcheck') || q.get('biocheck') || q.get('cellcheck') || q.get('physcheck') || q.get('assaycheck');   // test runs stay paused so the page settles
   if (q.get('autotest')) runAutotest(q);
   if (q.get('savetest')) {
     // Round-trip the whole simulation: run a scenario, snapshot it, wipe the world, restore, and
@@ -10215,14 +11069,25 @@ function start(data) {
       const after = computeStats();
       const inHost2 = S.bact.reduce((n, b) => n + (b.host ? 1 : 0), 0);
       const epiInf2 = S.epi ? after.epi.eclipse + after.epi.productive : -1;
+      // The internal state has to survive the trip too, or a resumed culture would be a different
+      // culture: its ribosomes, its alarmone, its damage and its half-copied chromosomes.
+      const phys = ['phiR', 'ppgpp', 'dna', 'ox', 'sos'];
+      const physOK = phys.every(k => Math.abs(before[k] - after[k]) < 1e-3);
+      const forksBefore = S.bact.reduce((n, b) => n + b.rounds.length, 0);
       const same = ['bact', 'cells', 'phago', 'humInf', 'spores', 'lysogens', 'res', 'dormant'].every(k => before[k] === after[k])
-        && Math.abs(bt - S.t) < 1e-6 && bn === S.bact.length && inHost === inHost2 && epiInf === epiInf2;
+        && Math.abs(bt - S.t) < 1e-6 && bn === S.bact.length && inHost === inHost2 && epiInf === epiInf2
+        && physOK && before.multifork === after.multifork;
       const fieldsOK = Math.abs(fieldSum('glc') - (before.glcSum || fieldSum('glc'))) >= 0;
       console.log('SAVETEST ' + id + (same ? ' OK' : ' FAIL') + ' size=' + Math.round(packed.length / 1024) + 'KB t=' + Math.round(S.t)
         + ' bact=' + before.bact + '->' + after.bact + ' cells=' + before.cells + '->' + after.cells
         + ' phago=' + before.phago + '->' + after.phago + ' inf=' + before.humInf + '->' + after.humInf
         + ' res=' + before.res + '->' + after.res + ' inHost=' + inHost + '->' + inHost2 + ' epiInf=' + epiInf + '->' + epiInf2
-        + ' dna=' + dna + '->' + (S.dna || []).length
+        + ' eDNA=' + dna + '->' + (S.dna || []).length
+        + ' | φR ' + before.phiR.toFixed(4) + '->' + after.phiR.toFixed(4)
+        + ' DNA ' + before.dna.toFixed(4) + '->' + after.dna.toFixed(4)
+        + ' ppGpp ' + before.ppgpp.toFixed(4) + '->' + after.ppgpp.toFixed(4)
+        + ' multifork ' + before.multifork + '->' + after.multifork
+        + ' forks ' + forksBefore + '->' + S.bact.reduce((n, b) => n + b.rounds.length, 0)
         + ' glc=' + (fieldSum('glc') / NG).toFixed(3));
       S.headless = false;
     })();
@@ -10324,10 +11189,13 @@ function start(data) {
       out.push(label + ' ' + n0 + '->' + live + ' (' + (100 * live / Math.max(1, n0)).toFixed(0) + '% survived)');
       return live / Math.max(1, n0);
     };
-    const seed = (sp, n) => { for (let i = 0; i < n; i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1 }); };
+    // From an exponential culture, ribosomes already built: these tests ask what an agent does to a
+    // growing cell, and an inoculum still building its ribosomes would answer a different question.
+    const seed = (sp, n) => { for (let i = 0; i < n; i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1, phiR: 0.45 }); };
     // SDS: a Gram-positive dissolves, a Gram-negative shrugs. EDTA removes the difference.
     const sdsPos = run('SDS 0.1% vs S. aureus', () => { seed('sau', 200); doseBulk('sds', 0.1); }, 20);
     const sdsNeg = run('SDS 0.1% vs E. coli  ', () => { seed('eco', 200); doseBulk('sds', 0.1); }, 20);
+    const sdsHigh = run('SDS 1% vs E. coli    ', () => { seed('eco', 200); doseBulk('sds', 1); }, 20);
     const sdsEdta = run('SDS 0.1% + EDTA 2 mM vs E. coli', () => { seed('eco', 200); doseBulk('sds', 0.1); doseBulk('edta', 2); }, 20);
     // Azide stops what breathes and spares what ferments. B. fragilis is measured against its own
     // untreated control, because an aerated field is already hostile to a strict anaerobe.
@@ -10385,10 +11253,17 @@ function start(data) {
     const clearOK = cl0 > 50 && cl1 === 0 && !FIELDS.t4.active && glcLeft > 8 && ampLeft > 3;
     out.push((clearOK ? 'Clear: ' : 'FAIL Clear: ') + cl0 + ' organisms -> ' + cl1 + ', phage ' + (FIELDS.t4.active ? 'still present' : 'gone') +
       ', medium untouched (glucose ' + glcLeft.toFixed(1) + ' mM, ampicillin ' + ampLeft.toFixed(1) + ' µg/mL)');
-    const ok = foldPae < foldCtl * 0.6 && pickOK && pr.chem.length > 0 && clearOK
-      && sdsPos < 0.5 && sdsNeg > 0.8 && sdsEdta < sdsNeg * 0.8 && azAer < 0.5 && azAna > anaCtl * 0.85
-      && moved * 5 < swamFree && genCccp > 0.3 && genAlone < 0.05;
-    console.log('TOOLCHECK ' + (ok ? 'OK' : 'FAIL'));
+    // Named, so a failure says which claim broke instead of only that one did.
+    const claims = {
+      'post-antibiotic effect': foldPae < foldCtl * 0.6, 'pick': pickOK, 'probe': pr.chem.length > 0, 'clear': clearOK,
+      'SDS kills Gram-positives': sdsPos < 0.5, 'SDS spares Gram-negatives': sdsNeg > 0.8,
+      'E. coli grows in 1% SDS': sdsHigh > 0.8,
+      'EDTA removes the difference': sdsEdta < sdsNeg * 0.8, 'azide stops an aerobe': azAer < 0.5,
+      'azide spares an anaerobe': azAna > anaCtl * 0.85, 'CCCP stops the motor': moved * 5 < swamFree,
+      'CCCP blocks aminoglycoside uptake': genCccp > 0.3, 'gentamicin alone kills': genAlone < 0.05,
+    };
+    const bad = Object.keys(claims).filter(k => !claims[k]);
+    console.log('TOOLCHECK ' + (bad.length ? 'FAIL (' + bad.join('; ') + ')' : 'OK') + ' — ' + Object.keys(claims).length + ' claims tested');
     for (const l of out) console.log('  TOOL ' + l);
     S.headless = false;
   }
@@ -10511,14 +11386,24 @@ function start(data) {
     S.headless = true;
     const out = [], fails = [];
     const clear = () => { startScenario('sandbox'); S.bact.length = 0; S.euk.length = 0; S.phago.length = 0; S.cells.length = 0; S.env.mutAmp = 0; };
-    const seed = (sp, n, o) => { for (let i = 0; i < n; i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), Object.assign({ act: 1 }, o || {})); };
+    // These are selectivity tests, not lag tests, so the inoculum comes from an exponential culture
+    // — ribosomes already built — exactly as it would at the bench. A plate scraping would spend
+    // the first part of every run building them, and the comparison would be about that instead.
+    const seed = (sp, n, o) => { for (let i = 0; i < n; i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), Object.assign({ act: 1, phiR: 0.45 }, o || {})); };
     const grow = (label, sp, setup, mins, expect) => {
       clear(); setup && setup(); seed(sp, 150);
-      const n0 = S.bact.length;
+      const n0 = S.bact.length, v0 = computeStats().vol;
       fastForward(mins);
+      const st = computeStats();
       const live = S.bact.filter(b => !b.dead).length, r = live / Math.max(1, n0);
-      const verdict = expect === 'grow' ? r > 1.3 : expect === 'hold' ? (r > 0.5 && r < 1.3) : r < 0.5;
-      out.push((verdict ? 'ok   ' : 'FAIL ') + label + ': ' + n0 + '->' + live + ' (×' + r.toFixed(2) + ', expected to ' + expect + ')');
+      // Whether a culture grew is a question about biomass, not about how many cells it is divided
+      // into. A culture that cannot grow still divides down once as it runs out — cells entering
+      // stationary phase get smaller — so the count can rise by a third while no biomass is made.
+      // For a culture that should merely hold, biovolume is the honest measure.
+      const rv = st.vol / Math.max(1e-9, v0);
+      const verdict = expect === 'grow' ? r > 1.3 : expect === 'hold' ? (r > 0.5 && rv < 1.5) : r < 0.5;
+      out.push((verdict ? 'ok   ' : 'FAIL ') + label + ': ' + n0 + '->' + live + ' (×' + r.toFixed(2) +
+        ' cells, ×' + rv.toFixed(2) + ' biovolume, expected to ' + expect + ')');
       if (!verdict) fails.push(label);
       return r;
     };
@@ -10545,7 +11430,9 @@ function start(data) {
     // A thermophile is not merely tolerant of heat; it needs it.
     grow('T. aquaticus at 37 °C', 'taq', () => { S.env.T = 37; }, 180, 'hold');
     grow('T. aquaticus at 70 °C', 'taq', () => { S.env.T = 70; }, 180, 'grow');
-    // No peptidoglycan: every wall-active drug is beside the point, and a macrolide is not.
+    // No peptidoglycan: every wall-active drug is beside the point, and a macrolide is not. The
+    // untreated run is the control the other three are read against — this organism is slow.
+    grow('M. pneumoniae, nothing added', 'mpn', () => { }, 600, 'grow');
     grow('M. pneumoniae + ampicillin 32', 'mpn', () => doseBulk('amp', 32), 600, 'grow');
     grow('M. pneumoniae + vancomycin 32', 'mpn', () => doseBulk('van', 32), 600, 'grow');
     grow('M. pneumoniae + azithromycin 1', 'mpn', () => doseBulk('azi', 1), 600, 'die');
@@ -10573,6 +11460,253 @@ function start(data) {
     if (!swOK) fails.push('swarming');
     console.log('BIOCHECK ' + (fails.length ? 'FAIL (' + fails.join(', ') + ')' : 'OK') + ' — ' + out.length + ' claims tested');
     for (const l of out) console.log('  BIO ' + l);
+    S.headless = false;
+  }
+  if (q.get('physcheck')) {
+    // The internal state is only worth having if it behaves like the measurements it came from.
+    // Each claim below is a published relation turned into a number that can contradict it.
+    S.headless = true;
+    const out = [], fails = [];
+    const ok = (pass, line) => { out.push((pass ? 'ok   ' : 'FAIL ') + line); if (!pass) fails.push(line.split(':')[0]); };
+    const clear = () => { startScenario('sandbox'); S.bact.length = 0; S.euk.length = 0; S.phago.length = 0; S.cells.length = 0; S.env.mutAmp = 0; };
+    const seed = (sp, n, o) => { for (let i = 0; i < n; i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), Object.assign({ act: 1 }, o || {})); };
+    // Balanced growth at a given temperature, with carbon kept ahead of demand so the limit is
+    // the cell's own machinery rather than the medium.
+    // Balanced growth is not a length of time, it is a number of generations: a culture has to have
+    // forgotten its inoculum before any of these relations hold. A cold culture therefore needs far
+    // longer on the clock than a warm one to be in the same state, so the run is ended by the
+    // population reaching a density, not by the clock.
+    const balanced = (T, rich) => {
+      clear(); S.env.T = T; S.env.rich = rich; S.env.o2Mode = 'kla'; S.env.kla = 120;
+      seed('eco', 10, { phiR: 0.25 });
+      let el = 0;
+      while (S.bact.filter(b => !b.dead).length < 320 && el < 4000) { feedCarbon(4); fastForward(20); el += 20; }
+      const st = computeStats();
+      return { mu: st.mu * 60, phiR: st.phiR, dna: st.dna, n: st.bact, L: st.len, el,
+        gens: Math.log2(Math.max(1, st.bact) / 10), V: st.bact ? st.vol / st.bact : 0 };
+    };
+    // ---- Scott et al. (2010): the ribosomal fraction is linear in growth rate ----
+    const pts = [18, 25, 31, 37].map(T => Object.assign({ T }, balanced(T, 1))).filter(p => p.n > 5);
+    for (const p of pts) {
+      const want = PHI_R0 + p.mu / TRANSL;
+      ok(Math.abs(p.phiR - want) < 0.05,
+        'Growth law at ' + p.T + ' °C: µ ' + p.mu.toFixed(2) + ' h⁻¹, φR ' + p.phiR.toFixed(3) + ' (law predicts ' + want.toFixed(3) + ')');
+    }
+    if (pts.length >= 3) {
+      // The slope of the measured line is the inverse of the translation rate, 1/4.2 h.
+      let sx = 0, sy = 0, sxx = 0, sxy = 0;
+      for (const p of pts) { sx += p.mu; sy += p.phiR; sxx += p.mu * p.mu; sxy += p.mu * p.phiR; }
+      const nP = pts.length, slope = (nP * sxy - sx * sy) / Math.max(1e-9, nP * sxx - sx * sx);
+      ok(Math.abs(slope - 1 / TRANSL) < 0.08, 'Slope of φR against µ: ' + slope.toFixed(3) + ' h (measured 1/4.2 = ' + (1 / TRANSL).toFixed(3) + ')');
+      const mono = pts.every((p, k) => k === 0 || p.phiR >= pts[k - 1].phiR - 0.01);
+      ok(mono, 'φR rises with growth rate across all four temperatures: ' + pts.map(p => p.phiR.toFixed(2)).join(' < '));
+      // ---- Trueba et al. (1982): temperature changes growth rate without changing cell size ----
+      // A fork is chemistry too, so cooling slows replication by the same factor it slows growth.
+      // The number of generations that fit inside C + D is unchanged, so size and DNA content hold.
+      // The closed form Cooper and Helmstetter derived for the average DNA per cell in a culture
+      // growing in balance: G = (τ/C·ln2)(2^((C+D)/τ) − 2^(D/τ)). The simulation never uses it —
+      // it tracks forks on individual chromosomes — so agreeing with it is a real check.
+      for (const p of pts) {
+        const d0 = BACT.eco, rate = clamp(p.mu / (60 * d0.mumax * 0.98), 0.08, 1.4);
+        const C = cNominal(d0) / rate, Dp = D_PERIOD / rate;
+        const tau = LN2 * 60 / p.mu;
+        const G = (tau / (C * LN2)) * (Math.pow(2, (C + Dp) / tau) - Math.pow(2, Dp / tau));
+        // The closed form assumes one exact C, one exact D and perfect balance. The cells have
+        // noise in all three, so agreement to a third is as close as the comparison can be asked.
+        ok(Math.abs(p.dna - G) / G < 0.35, 'Cooper–Helmstetter at ' + p.T + ' °C: simulation ' + p.dna.toFixed(2) +
+          ' genome eq., closed form ' + G.toFixed(2) + ' (τ ' + tau.toFixed(0) + ' min, C ' + C.toFixed(0) + ', D ' + Dp.toFixed(0) + ')');
+      }
+      // What the cells actually contain, so a disagreement above can be traced rather than guessed.
+      { const live = S.bact.filter(b => !b.dead); let o = 0, c = 0, r = 0, v = 0;
+        for (const b of live) { o += b.ori; c += b.chr; r += b.rounds.length; v += vol(b, BACT[b.sp]); }
+        const nL = Math.max(1, live.length);
+        console.log('  PHY      at 37 °C the cells hold: ' + (o / nL).toFixed(2) + ' origins, ' + (c / nL).toFixed(2) +
+          ' finished chromosomes, ' + (r / nL).toFixed(2) + ' rounds running, ' + (v / nL).toFixed(2) +
+          ' µm³ — initiation mass ' + initiationVolume(live[0], BACT.eco).toFixed(3) + ' µm³ per origin'); }
+      const cold = pts[0], warmP = pts[pts.length - 1];
+      ok(Math.abs(cold.dna - warmP.dna) / warmP.dna < 0.25, 'Temperature barely moves DNA content: ' + cold.dna.toFixed(2) +
+        ' genome eq. at ' + cold.T + ' °C against ' + warmP.dna.toFixed(2) + ' at ' + warmP.T + ' °C, while µ went ' +
+        cold.mu.toFixed(2) + ' → ' + warmP.mu.toFixed(2) + ' h⁻¹');
+    }
+    // ---- Schaechter, Maaløe and Kjeldgaard (1958): nutrients do change size, and DNA with it ----
+    // The same temperature throughout, so the fork speed is fixed; only the medium differs. Now
+    // the generations do pack into C + D differently, and the cells answer in size and ploidy.
+    const med = [0.55, 0.78, 1].map(r => Object.assign({ r }, balanced(37, r))).filter(p => p.n > 5);
+    if (med.length === 3) {
+      const poor = med[0], rich = med[2];
+      ok(rich.V > poor.V * 1.15, 'Richer medium builds bigger cells: ' + poor.V.toFixed(2) + ' µm³ on minimal salts, ' +
+        rich.V.toFixed(2) + ' µm³ in rich broth (µ ' + poor.mu.toFixed(2) + ' → ' + rich.mu.toFixed(2) + ' h⁻¹)');
+      ok(rich.dna > poor.dna + 0.1, 'And loads them with more DNA: ' + poor.dna.toFixed(2) + ' genome eq. against ' + rich.dna.toFixed(2));
+      ok(rich.dna > 1.2 && rich.dna < 6, 'Cells in rich medium hold between 1.2 and 6 genome equivalents: ' + rich.dna.toFixed(2));
+      // The two knobs side by side, which is the point Trueba's experiment made. Slowing a culture
+      // with the medium shrinks its cells almost in proportion; slowing it just as much by cooling
+      // it barely touches them, because the forks slow with everything else. Expressed as how much
+      // volume moves per unit of growth rate, the two are not merely different in size but in sign.
+      if (pts.length >= 3) {
+        const cold = pts[0], warmP = pts[pts.length - 1];
+        const eT = Math.log(cold.V / warmP.V) / Math.log(cold.mu / warmP.mu);
+        const eN = Math.log(poor.V / rich.V) / Math.log(poor.mu / rich.mu);
+        ok(eN > 1 && eT < 0.3, 'Size follows growth rate only when the medium sets it: d ln V / d ln µ is ' +
+          eN.toFixed(2) + ' across media but ' + eT.toFixed(2) + ' across temperature');
+      }
+    }
+    // ---- lag phase as a mechanism, not a timer ----
+    // Two inocula of the same size into the same medium: one carrying ribosomes, one not. The
+    // difference in when they reach their stride is the whole of lag phase.
+    const lagRun = (phiR) => {
+      clear(); S.env.T = 37; S.env.o2Mode = 'kla'; S.env.kla = 120; feedCarbon(20);
+      seed('eco', 40, { phiR });
+      const marks = [];
+      for (let k = 0; k < 8; k++) { fastForward(15); marks.push(computeStats().mu * 60); }
+      return marks;
+    };
+    const cold = lagRun(PHI_R0 + 0.01), warm = lagRun(0.4);
+    const firstFast = a => { for (let k = 0; k < a.length; k++) if (a[k] > 0.6) return 15 * (k + 1); return 999; };
+    ok(firstFast(cold) > firstFast(warm),
+      'Lag is ribosome-limited: a ribosome-poor inoculum reaches µ=0.6 h⁻¹ at ' + firstFast(cold) +
+      ' min, a ribosome-rich one at ' + firstFast(warm) + ' min');
+    ok(warm[0] > cold[0] + 0.1, 'Ribosome-rich cells grow immediately: µ after 15 min ' +
+      warm[0].toFixed(2) + ' vs ' + cold[0].toFixed(2) + ' h⁻¹');
+    // ---- the stringent response ----
+    clear(); S.env.T = 37; feedCarbon(20); seed('eco', 80, { phiR: 0.35 });
+    fastForward(30); const ppFed = computeStats().ppgpp;
+    F.glc.fill(0); touch('glc'); fastForward(90);
+    const ppStarved = computeStats().ppgpp;
+    ok(ppStarved > ppFed + 0.2, 'ppGpp answers starvation: ' + ppFed.toFixed(2) + ' fed, ' + ppStarved.toFixed(2) + ' after the carbon ran out');
+    const phiAfter = computeStats().phiR;
+    ok(phiAfter < 0.35, 'Ribosome synthesis stops under ppGpp: φR fell to ' + phiAfter.toFixed(3) + ' from 0.350');
+    // ---- SOS and SulA filamentation ----
+    const sosRun = (dose) => {
+      clear(); S.env.T = 37; S.env.o2Mode = 'kla'; S.env.kla = 120; feedCarbon(20);
+      seed('eco', 100, { phiR: 0.3 });
+      if (dose) doseBulk('cip', dose);
+      fastForward(90);
+      const st = computeStats();
+      return { sos: st.sos, len: st.len, n: st.bact, fil: st.sosOn };
+    };
+    const ctl = sosRun(0);
+    // Filamentation is a sub-lethal effect. Above the MIC the drug stops growth, and a cell that
+    // cannot elongate cannot make a filament; the long cells are found just below it.
+    const sweep = [0.002, 0.004, 0.008].map(c => Object.assign({ c }, sosRun(c)));
+    out.push('     cipro sweep: ' + sweep.map(s => s.c + ' µg/mL → SOS ' + s.sos.toFixed(2) + ', ' + s.len.toFixed(2) + ' µm, n=' + s.n).join(' | ') +
+      ' (untreated ' + ctl.len.toFixed(2) + ' µm, n=' + ctl.n + ')');
+    const best = sweep.reduce((a, s) => s.len > a.len ? s : a, sweep[0]);
+    ok(sweep.some(s => s.sos > ctl.sos + 0.2), 'Ciprofloxacin turns SOS on: mean induction ' + ctl.sos.toFixed(2) +
+      ' untreated against ' + Math.max(...sweep.map(s => s.sos)).toFixed(2) + ' treated');
+    ok(best.len > ctl.len * 1.25, 'Cells filament rather than divide: ' + ctl.len.toFixed(2) + ' µm untreated, ' +
+      best.len.toFixed(2) + ' µm at ' + best.c + ' µg/mL (' + best.fil + ' of ' + best.n + ' cells with division blocked)');
+    // ---- oxidative damage, and what catalase is for ----
+    const peroxide = (sp) => {
+      clear(); S.env.T = 37; S.env.o2Mode = 'kla'; S.env.kla = 120; feedCarbon(20);
+      seed(sp, 120, { phiR: 0.3 });
+      doseBulk('h2o2', 0.3); fastForward(40);
+      const st = computeStats();
+      return { ox: st.ox, surv: st.bact / 120 };
+    };
+    const pos = peroxide('eco'), neg = peroxide('efa'), air = (() => {
+      clear(); S.env.T = 37; S.env.o2Mode = 'kla'; S.env.kla = 120; feedCarbon(20);
+      seed('efa', 120, { phiR: 0.3 }); fastForward(240);
+      return computeStats();
+    })();
+    ok(neg.ox > pos.ox * 1.5, 'Catalase pays the peroxide bill: damage ' + pos.ox.toFixed(3) +
+      ' in catalase-positive E. coli, ' + neg.ox.toFixed(3) + ' in catalase-negative E. faecalis');
+    // And the other half of the claim: lacking catalase is not the same as being poisoned by air.
+    ok(air.ox < 0.1 && air.bact > 120, 'A catalase-negative organism still grows in air: E. faecalis after four hours, ' +
+      air.bact + ' cells from 120, damage ' + air.ox.toFixed(3));
+    // ---- the cytometer reads what the cells actually contain ----
+    clear(); S.env.T = 37; S.env.o2Mode = 'kla'; S.env.kla = 120; feedCarbon(20);
+    seed('eco', 200, { phiR: 0.3 }); fastForward(90);
+    const cy = runCytometry();
+    const st2 = computeStats();
+    ok(cy && cy.s.n === Math.min(st2.bact, 5000), 'Cytometer acquires every cell in the sample: ' + (cy ? cy.s.n : 0) + ' events for ' + st2.bact + ' cells');
+    ok(cy && Math.abs(cy.s.meanDna - st2.dna) < 0.15, 'Measured DNA matches the population mean: ' +
+      (cy ? cy.s.meanDna.toFixed(2) : '—') + ' from the cytogram, ' + st2.dna.toFixed(2) + ' from the cells themselves');
+    ok(cy && cy.s.cv > 0.02 && cy.s.cv < 0.6, 'Histogram CV is in the range a real instrument gives: ' + (cy ? (100 * cy.s.cv).toFixed(1) : '—') + '%');
+    ok(cy && Math.abs(cy.s.pct1 + cy.s.pct2 + cy.s.pct4 - 100) < 0.01, 'The three DNA gates account for every event');
+    console.log('PHYSCHECK ' + (fails.length ? 'FAIL (' + fails.length + ')' : 'OK') + ' — ' + out.length + ' claims tested');
+    for (const l of out) console.log('  PHY ' + l);
+    S.headless = false;
+  }
+  if (q.get('assaycheck')) {
+    // Two assays whose whole value is the number they produce, so the number is what gets checked.
+    S.headless = true;
+    const out = [], fails = [];
+    const ok = (pass, line) => { out.push((pass ? 'ok   ' : 'FAIL ') + line); if (!pass) fails.push(line.split(':')[0]); };
+    // A message is built whether its claim holds or not, so nothing in one may assume it did.
+    const nn = (v, dp) => v == null || !isFinite(v) ? '—' : v.toFixed(dp == null ? 2 : dp);
+    const nc = (v, u) => v == null || !isFinite(v) ? 'off scale' : fmtC(v, u);
+    const clear = () => { startScenario('sandbox'); S.bact.length = 0; S.euk.length = 0; S.phago.length = 0; S.cells.length = 0; S.env.mutAmp = 0; };
+    const culture = (sp, n) => { clear(); S.env.T = 37; S.env.o2Mode = 'kla'; S.env.kla = 120; feedCarbon(20);
+      for (let i = 0; i < (n || 200); i++) spawnBact(sp, 40 + rand() * (W - 80), 40 + rand() * (H - 80), { act: 1, phiR: 0.45 });
+      fastForward(30); };
+    // ---- the checkerboard ----
+    culture('eco');
+    // The edges of the board have to agree with the single-drug panel, or the index means nothing.
+    const cbRef = checkerboard('amp', 'gen', 'eco');
+    const mdA = microdilution('amp', 'eco'), mdB = microdilution('gen', 'eco');
+    ok(cbRef && cbRef.micA != null && mdA && mdA.mic != null && Math.abs(Math.log2(cbRef.micA / mdA.mic)) < 1.1,
+      'Board edge agrees with the microdilution panel for ampicillin: ' + nc(cbRef && cbRef.micA, 'µg/mL') + ' against ' + nc(mdA && mdA.mic, 'µg/mL'));
+    ok(cbRef && cbRef.micB != null && mdB && mdB.mic != null && Math.abs(Math.log2(cbRef.micB / mdB.mic)) < 1.1,
+      'And for gentamicin: ' + nc(cbRef && cbRef.micB, 'µg/mL') + ' against ' + nc(mdB && mdB.mic, 'µg/mL'));
+    ok(checkerboard('amp', 'amp', 'eco') === null, 'A drug cannot be crossed against itself');
+    // With no interaction written into the model, two drugs that both work on a resting cell have
+    // to come out additive. An index near one is the null result this assay must be able to give.
+    const indep = checkerboard('gen', 'col', 'eco');
+    ok(indep && indep.fic != null && indep.fic > 0.7 && indep.fic < 1.6,
+      'Two independent drugs read as additive: gentamicin with colistin gives an FIC index of ' + nn(indep && indep.fic));
+    // And the one interaction the model does contain, because it is mechanism rather than fitting:
+    // a wall under attack lets an aminoglycoside in faster, so the pair does better than additive.
+    const syn = checkerboard('amp', 'gen', 'eco');
+    ok(syn && syn.fic != null && indep && indep.fic != null && syn.fic < indep.fic * 0.9,
+      'A damaged wall lets an aminoglycoside in: ampicillin with gentamicin gives ' + nn(syn && syn.fic) +
+      ' against ' + nn(indep && indep.fic) + ' for a pair that does not interact');
+    out.push('     verdicts: gen+col "' + (indep ? indep.verdict : '—') + '" · amp+gen "' + (syn ? syn.verdict : '—') + '"');
+    // The synergy has to be in the simulation too, not only in the assay that measures it, or the
+    // instrument would be reporting on something the culture never does.
+    const killOff = (drugs) => {
+      culture('eco', 300);
+      const n0 = S.bact.filter(b => !b.dead).length;
+      for (const [k, c] of drugs) doseBulk(k, c);
+      fastForward(60);
+      return S.bact.filter(b => !b.dead).length / Math.max(1, n0);
+    };
+    const mA = BACT.eco.MIC.amp, mG = BACT.eco.MIC.gen;
+    const sAmp = killOff([['amp', mA / 2]]), sGen = killOff([['gen', mG / 2]]), sBoth = killOff([['amp', mA / 2], ['gen', mG / 2]]);
+    ok(sBoth < Math.min(sAmp, sGen) * 0.7, 'And the culture agrees: over an hour at half an MIC of each the population went ×' +
+      sBoth.toFixed(2) + ', against ×' + sAmp.toFixed(2) + ' for ampicillin alone and ×' + sGen.toFixed(2) + ' for gentamicin alone');
+    // ---- the fluctuation test ----
+    culture('eco', 120);
+    const t0 = S.t, n0 = S.bact.length;
+    const fl = fluctuationTest('cip', 7);
+    ok(fl != null, 'The fluctuation test runs and returns counts');
+    ok(Math.abs(S.t - t0) < 1e-6 && S.bact.length === n0,
+      'It hands the field back exactly as it borrowed it: t ' + t0.toFixed(1) + '→' + S.t.toFixed(1) + ', ' + n0 + '→' + S.bact.length + ' cells');
+    if (fl) {
+      ok(fl.mean > 0, 'Mutants were recovered: ' + fl.counts.join(', ') + ' (mean ' + fl.mean.toFixed(2) + ')');
+      // The claim of 1943, and the whole reason the experiment settled the question. Against it, a
+      // Poisson sample of the same mean — what induced resistance would have had to look like.
+      let ps = [], pv = 0, pm = 0;
+      for (let k = 0; k < fl.counts.length; k++) { let L = Math.exp(-fl.mean), p = 1, c = -1; do { c++; p *= rand(); } while (p > L); ps.push(c); }
+      pm = ps.reduce((a, b) => a + b, 0) / ps.length;
+      for (const c of ps) pv += (c - pm) * (c - pm);
+      pv /= Math.max(1, ps.length - 1);
+      const pvmr = pm > 0 ? pv / pm : 0;
+      ok(fl.vmr != null && fl.vmr > 2.5, 'The counts are wildly over-dispersed: variance/mean ' + nn(fl.vmr, 1) +
+        ', where a Poisson sample of the same mean gives ' + nn(pvmr));
+      ok(fl.vmr != null && fl.vmr > pvmr * 2.5, 'Which is the Luria–Delbrück result: mutation during growth, not induced by the challenge');
+      ok(fl.zeros > 0 && fl.rate != null && fl.rate > 0 && fl.rate < 1,
+        fl.zeros + ' of ' + fl.counts.length + ' cultures had none, giving a rate of ' +
+        (fl.rate == null ? 'not estimable' : fmtSci(fl.rate)) + ' per cell per generation');
+      // And the estimator itself: the rate recovered from the zero fraction against the rate the
+      // cultures were actually given. Getting this within a factor of a few is the real test.
+      ok(fl.rate != null && Math.abs(Math.log10(fl.rate / fl.trueRate)) < 0.7,
+        'The P₀ estimate recovers the rate it was given: ' + (fl.rate == null ? '—' : fmtSci(fl.rate)) +
+        ' estimated against ' + fmtSci(fl.trueRate) + ' set');
+      ok(fl.counts.some(c => c > fl.mean * 2.5), 'At least one culture is a jackpot: highest count ' + Math.max.apply(null, fl.counts) +
+        ' against a mean of ' + fl.mean.toFixed(2));
+    }
+    console.log('ASSAYCHECK ' + (fails.length ? 'FAIL (' + fails.length + ')' : 'OK') + ' — ' + out.filter(l => l[0] !== ' ').length + ' claims tested');
+    for (const l of out) console.log('  ASY ' + l);
     S.headless = false;
   }
   if (q.get('probe')) {                      // ?probe=<scenario>&at=5,15,30[&solve=1] — metric at checkpoints
@@ -10620,6 +11754,8 @@ function start(data) {
     if (q.get('modal') === 'experiments') openExperiments();
     if (q.get('modal') === 'brief') openBrief(qs);
     if (q.get('modal') === 'help') openHelp();
+    // ?cb=amp,gen runs a checkerboard before the notebook opens, so the board can be looked at.
+    if (q.get('cb')) { const p2 = q.get('cb').split(','); runCheckerboard(p2[0], p2[1]); }
     if (q.get('modal') === 'data') { S.stats = computeStats(); openData(q.get('dtab') || 'series'); }
     if (q.get('modal') === 'result') { S.stats = computeStats(); openResult(q.get('outcome') || 'win'); }
     renderLog(); renderHud(); chartDirty = true;
